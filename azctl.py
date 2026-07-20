@@ -87,6 +87,37 @@ def bootstrap_venv_python(venv_dir, is_windows) -> pathlib.Path:
     return pathlib.Path(venv_dir) / "bin" / "python"
 
 
+def _venv_has_pip(vpy, runner=subprocess.run) -> bool:
+    """True when vpy exists and its own `-m pip --version` succeeds.
+
+    A venv can exist on disk yet be structurally unusable forever (created
+    with `--without-pip`, or on a Debian/Ubuntu system missing python3-venv's
+    ensurepip prerequisite) — vpy.exists() alone can't tell those apart from
+    a healthy venv, so every bootstrap would fail identically on every run.
+    """
+    if not pathlib.Path(vpy).exists():
+        return False
+    try:
+        probe = runner([str(vpy), "-m", "pip", "--version"], capture_output=True, text=True)
+    except Exception:  # noqa: BLE001 - treat any failure as "not usable"
+        return False
+    return probe.returncode == 0
+
+
+def _deps_importable(vpy, runner=subprocess.run) -> bool:
+    """True when `import rich, psutil` succeeds inside vpy's interpreter.
+
+    pip's exit code alone is not proof of a working install: a corrupted
+    package (dist-info intact, payload missing/quarantined) makes pip report
+    "already satisfied" and exit 0 without reinstalling anything.
+    """
+    try:
+        probe = runner([str(vpy), "-c", "import rich, psutil"], capture_output=True, text=True)
+    except Exception:  # noqa: BLE001
+        return False
+    return probe.returncode == 0
+
+
 def _bootstrap_explain(venv_dir, vpy, detail="") -> None:
     lines = ["azctl could not set up its dependencies (rich and psutil)."]
     if detail:
@@ -96,9 +127,16 @@ def _bootstrap_explain(venv_dir, vpy, detail="") -> None:
         "azctl keeps them in a private virtualenv (your system Python is never touched):",
         "    " + str(venv_dir),
         "",
-        "The usual causes are no network access or a missing/broken pip.",
+        "The usual causes are no network access, a missing/broken pip, a corrupted",
+        "virtualenv, or (on Debian/Ubuntu) a system Python missing python3-venv.",
         "You can finish the setup manually with:",
         "    " + str(vpy) + " -m pip install rich psutil",
+        "If that reports \"already satisfied\" but azctl still can't import them,",
+        "the install itself may be corrupted — force a clean reinstall with:",
+        "    " + str(vpy) + " -m pip install --force-reinstall --no-cache-dir rich psutil",
+        "and if the virtualenv is broken beyond that (e.g. no pip at all), delete it",
+        "and let azctl rebuild it from scratch:",
+        "    rm -rf " + str(venv_dir),
         "or install rich and psutil into any Python and re-run azctl with that python.",
     ]
     print("\n".join(lines), file=sys.stderr)
@@ -119,7 +157,19 @@ def _bootstrap_and_reexec() -> None:
         )
         raise SystemExit(1)
 
-    if not vpy.exists():
+    if not _venv_has_pip(vpy):
+        # Covers "never created" and "exists but broken/pip-less" alike (e.g.
+        # `python3 -m venv --without-pip`, or a Debian/Ubuntu system missing
+        # python3-venv/ensurepip) — recreate from scratch instead of retrying
+        # a pip install that would fail identically on every future run.
+        if venv_dir.exists():
+            shutil.rmtree(str(venv_dir), ignore_errors=True)
+        print(
+            "azctl: first run — setting up a private environment in %s "
+            "(this can take a few seconds)..." % venv_dir,
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "venv", str(venv_dir)],
@@ -136,10 +186,21 @@ def _bootstrap_and_reexec() -> None:
                 "Creating the virtualenv failed:\n" + (proc.stderr or proc.stdout or "").strip(),
             )
             raise SystemExit(1)
+        if not _venv_has_pip(vpy):
+            _bootstrap_explain(
+                venv_dir,
+                vpy,
+                "The virtualenv was created but has no usable pip — a common symptom "
+                "on Debian/Ubuntu systems missing the python3-venv or python3-pip "
+                "packages. Install those with your system package manager (or "
+                "delete the virtualenv above and ensure `python3 -m ensurepip` "
+                "works), then re-run azctl.",
+            )
+            raise SystemExit(1)
 
     # stderr + flush: keeps stdout clean for `status --json` and survives execve.
     print(
-        "azctl: first run — installing rich and psutil into %s ..." % venv_dir,
+        "azctl: installing rich and psutil into %s ..." % venv_dir,
         file=sys.stderr,
         flush=True,
     )
@@ -157,6 +218,32 @@ def _bootstrap_and_reexec() -> None:
         tail = "\n".join(combined.splitlines()[-15:])
         _bootstrap_explain(venv_dir, vpy, "pip install failed:\n" + tail)
         raise SystemExit(1)
+
+    if not _deps_importable(vpy):
+        # pip exited 0 but the packages aren't actually importable: retry
+        # once with a forced, cache-busting reinstall before giving up.
+        try:
+            proc = subprocess.run(
+                [
+                    str(vpy), "-m", "pip", "install", "--quiet",
+                    "--force-reinstall", "--no-cache-dir", "rich", "psutil",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _bootstrap_explain(venv_dir, vpy, "Running pip failed: %s" % exc)
+            raise SystemExit(1)
+        if proc.returncode != 0 or not _deps_importable(vpy):
+            combined = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+            tail = "\n".join(combined.splitlines()[-15:])
+            _bootstrap_explain(
+                venv_dir,
+                vpy,
+                "rich/psutil are still not importable even after a forced "
+                "reinstall:\n" + tail,
+            )
+            raise SystemExit(1)
 
     env = dict(os.environ)
     env[BOOTSTRAP_SENTINEL] = "1"
@@ -303,7 +390,10 @@ class LogStore:
 
 
 class _Svc:
-    __slots__ = ("name", "proc", "launched_at", "stopping", "state", "ever_started", "exit_code", "reader")
+    __slots__ = (
+        "name", "proc", "launched_at", "stopping", "state", "ever_started",
+        "exit_code", "reader", "broken_reason",
+    )
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -314,6 +404,7 @@ class _Svc:
         self.ever_started = False
         self.exit_code = None
         self.reader = None
+        self.broken_reason = None
 
 
 def port_open(host: str, port: int, timeout: float = 0.25) -> bool:
@@ -324,14 +415,22 @@ def port_open(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _wrap_windows_shim(exe: str) -> "list[str]":
+    """npm installs .cmd/.bat batch shims on Windows (no shebang mechanism);
+    CreateProcess can't exec a batch script directly (WinError 193), so it
+    must be run through cmd /c — the same trick Node's cross-spawn uses."""
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", exe]
+    return [exe]
+
+
 def default_command_for(name: str, config: Config) -> "list[str] | None":
     """Resolve the azurite-<service> executable; None when not installed."""
     exe = shutil.which("azurite-" + name)
     if exe is None:
         return None
     port = config.port_for(name)
-    return [
-        exe,
+    return _wrap_windows_shim(exe) + [
         "--%sHost" % name, config.host,
         "--%sPort" % name, str(port),
         "--location", config.data_dir,
@@ -387,6 +486,18 @@ class ServiceManager:
                 # Launched then died on its own: sticky BROKEN until Start/Stop.
                 svc.exit_code = rc
                 svc.launched_at = None
+                if rc == 127:
+                    # The realistic "Node missing" shape: the kernel execs the
+                    # #!/usr/bin/env node shebang script fine (FileNotFoundError
+                    # never fires), then `env` itself fails to resolve `node`
+                    # and the child exits 127 within milliseconds. Surface the
+                    # same clear message Popen's FileNotFoundError path uses,
+                    # instead of a silent, unexplained BROKEN.
+                    svc.broken_reason = (
+                        "Node.js runtime not found — install Node, then %s" % INSTALL_HINT
+                    )
+                else:
+                    svc.broken_reason = None
                 return BROKEN
         if port_open(self.config.host, port, self.health_timeout):
             return PORT_IN_USE
@@ -415,6 +526,12 @@ class ServiceManager:
                 ServiceView(name, svc.state, self.config.port_for(name), pid, uptime, svc.ever_started, svc.exit_code)
             )
         return out
+
+    def broken_reason(self, name: str) -> "str | None":
+        """A distinguishing explanation for a BROKEN death (e.g. Node
+        missing), or None for a generic/unexplained death or non-BROKEN
+        state. Cleared by Start/Stop/Free-port like the rest of the record."""
+        return self._svcs[name].broken_reason
 
     # -- log plumbing ----------------------------------------------------
     def _read_output(self, name: str, proc) -> None:
@@ -466,6 +583,7 @@ class ServiceManager:
         svc.ever_started = True
         svc.stopping = False
         svc.exit_code = None
+        svc.broken_reason = None
         svc.state = STARTING
         svc.reader = threading.Thread(target=self._read_output, args=(name, proc), daemon=True)
         svc.reader.start()
@@ -480,6 +598,7 @@ class ServiceManager:
             svc.proc = None
             svc.launched_at = None
             svc.stopping = False
+            svc.broken_reason = None
             svc.state = self._compute_state(svc)
             return True, "%s is not running." % title, "grey"
         svc.stopping = True
@@ -491,6 +610,7 @@ class ServiceManager:
         svc.proc = None
         svc.launched_at = None
         svc.stopping = False
+        svc.broken_reason = None
         if svc.reader is not None:
             svc.reader.join(timeout=1.0)
             svc.reader = None
@@ -538,33 +658,37 @@ class ServiceManager:
         svc.launched_at = None
         svc.stopping = False
         svc.exit_code = None
+        svc.broken_reason = None
 
     # -- log saving ------------------------------------------------------
     def save_service_log(self, name: str, directory=None) -> "tuple[bool, str, str]":
-        directory = directory or os.getcwd()
         lines = self.logs.lines(name)
-        path = os.path.abspath(os.path.join(directory, "azurite-%s.log" % name))
+        # os.getcwd() itself raises FileNotFoundError when the directory
+        # azctl was launched from has since been removed — keep it inside
+        # the same guard as the file write so that's a red message too.
         try:
+            resolved_dir = directory or os.getcwd()
+            path = os.path.abspath(os.path.join(resolved_dir, "azurite-%s.log" % name))
             with open(path, "w", encoding="utf-8") as fh:
                 for line in lines:
                     fh.write(line.text + "\n")
         except OSError as exc:
-            return False, "Could not write %s: %s" % (path, exc), "red"
+            return False, "Could not save the %s log: %s" % (name, exc), "red"
         if lines:
             return True, "Wrote %d lines to %s" % (len(lines), path), "green"
         return True, "Wrote 0 lines to %s (log was empty)" % path, "yellow"
 
     def save_merged_log(self, directory=None) -> "tuple[bool, str, str]":
-        directory = directory or os.getcwd()
         lines = self.logs.merged()
-        path = os.path.abspath(os.path.join(directory, "azurite-all.log"))
         try:
+            resolved_dir = directory or os.getcwd()
+            path = os.path.abspath(os.path.join(resolved_dir, "azurite-all.log"))
             with open(path, "w", encoding="utf-8") as fh:
                 for line in lines:
                     stamp = time.strftime("%H:%M:%S", time.localtime(line.wall))
                     fh.write("%s [%s] %s\n" % (stamp, line.service, line.text))
         except OSError as exc:
-            return False, "Could not write %s: %s" % (path, exc), "red"
+            return False, "Could not save the merged log: %s" % exc, "red"
         if lines:
             return True, "Wrote %d lines to %s" % (len(lines), path), "green"
         return True, "Wrote 0 lines to %s (log was empty)" % path, "yellow"
@@ -622,24 +746,28 @@ def kill_pid(pid: int, timeout: float = 2.0) -> bool:
         return True
     try:
         root = psutil.Process(pid)
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return True
     procs = []
     try:
         procs = root.children(recursive=True)
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     procs.append(root)
     for proc in procs:
         try:
             proc.terminate()
-        except psutil.NoSuchProcess:
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # AccessDenied (e.g. a root-owned process on a shared machine)
+            # must never propagate out of here and crash the TUI — the
+            # caller's post-kill port recheck already reports "did not die"
+            # honestly when the process survives.
             pass
     _gone, alive = psutil.wait_procs(procs, timeout=timeout)
     for proc in alive:
         try:
             proc.kill()
-        except psutil.NoSuchProcess:
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return True
 
@@ -703,7 +831,9 @@ def _run_version(executable: str) -> "str | None":
     if exe is None:
         return None
     try:
-        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=3)
+        proc = subprocess.run(
+            _wrap_windows_shim(exe) + ["--version"], capture_output=True, text=True, timeout=3
+        )
     except Exception:
         return None
     text = (proc.stdout or proc.stderr or "").strip()
@@ -1101,6 +1231,14 @@ FOOTER_SIZE = 4
 TABLE_ROW_Y0 = HEADER_SIZE + 2       # first service row (heading sits above it)
 BUTTON_ROW_FROM_BOTTOM = 2           # button bar row = height - 2
 
+# Below this height, Rich's Layout silently shrinks the footer (dropping
+# rows from the bottom) rather than erroring — which desyncs the static
+# BUTTON_ROW_FROM_BOTTOM arithmetic from what's actually on screen, and can
+# hide the confirmation prompt entirely while Enter still acts on it. Rather
+# than track Rich's ad hoc clipping, refuse to draw the interactive frame
+# (and to honour clicks/blind Enters) below this floor.
+MIN_TERMINAL_HEIGHT = HEADER_SIZE + TABLE_SIZE + 1 + FOOTER_SIZE  # 13
+
 MSG_STYLES = {"green": "green", "red": "bold red", "yellow": "yellow", "grey": "grey50"}
 
 
@@ -1244,18 +1382,22 @@ def render_footer(ui: UIState, now: float) -> "Group":
         )
     else:
         rows.append(render_button_bar(ui.button))
-    hints = Text(
-        "↑↓ service · ←→ buttons · Enter run · a all-logs · t times · "
-        "c conn str · S save all · ? help · q quit",
-        style="grey50",
-        no_wrap=True,
-        overflow="ellipsis",
-    )
-    hints.append("   logs: ", style="grey50")
+    # The mode indicator goes first: at narrow/normal terminal widths the
+    # no_wrap+ellipsis line truncates from the right, and this is the one
+    # piece of state BEHAVIOR.md says you must always be able to read ("the
+    # footer shows whether this mode is on or off"). Put the low-priority
+    # static hint text after it so *that* is what gets eaten by the ellipsis.
+    hints = Text(no_wrap=True, overflow="ellipsis")
+    hints.append("logs: ", style="grey50")
     if ui.combined_logs:
         hints.append("ALL", style="bold yellow")
     else:
         hints.append("selected", style="grey50")
+    hints.append(
+        "   ↑↓ service · ←→ buttons · Enter run · a all-logs · t times · "
+        "c conn str · S save all · ? help · q quit",
+        style="grey50",
+    )
     rows.append(hints)
     if ui.message is not None and ui.message[2] > now:
         rows.append(
@@ -1264,6 +1406,19 @@ def render_footer(ui: UIState, now: float) -> "Group":
     else:
         rows.append(Text(""))
     return Group(*rows)
+
+
+def render_too_small(height: int) -> "Panel":
+    return Panel(
+        Text(
+            "Terminal window is too small (%d rows). Resize to at least %d rows to use azctl."
+            % (height, MIN_TERMINAL_HEIGHT),
+            style="bold yellow",
+            no_wrap=True,
+            overflow="ellipsis",
+        ),
+        title="azctl",
+    )
 
 
 HELP_ROWS = (
@@ -1348,6 +1503,14 @@ class Dashboard:
     """Owns UIState + a ServiceManager; handle_event() is pure UI logic and
     fully testable without a terminal. run() is the only impure part."""
 
+    # How long a confirmed action is given to finish before handle_event()
+    # stops waiting on it and returns control to the render/input loop. Fast
+    # (in-process/fake) actions finish well inside this and the caller still
+    # sees a fully synchronous result; slow ones (a real kill_pid() wait, the
+    # Free-port settle sleep) fall through to the async path below instead of
+    # freezing the UI for their full multi-second duration.
+    _DISPATCH_GRACE = 0.2
+
     def __init__(self, config: Config, manager, *, clock=time.time, sleep=time.sleep):
         self.config = config
         self.manager = manager
@@ -1359,6 +1522,10 @@ class Dashboard:
         self.exit_note = None
         self.size = (80, 24)  # (width, height); refreshed every frame
         self._pending_action = None
+        self._busy = False
+        self._pending_done = None
+        self._pending_box = None
+        self._pending_thread = None
 
     # -- messages --------------------------------------------------------
     def show(self, text: str, style: str) -> None:
@@ -1378,6 +1545,46 @@ class Dashboard:
         self.ui.pending_prompt = prompt
         self._pending_action = action
 
+    # -- dispatching confirmed actions without freezing the UI -----------
+    def _dispatch(self, action) -> None:
+        """Run a confirmed action on a worker thread. If it finishes within
+        _DISPATCH_GRACE, handle_event() returns with the real result already
+        shown (indistinguishable from the old fully-synchronous behaviour).
+        Otherwise it keeps running in the background — polled and drained by
+        _poll_pending() from the render loop — while the UI stays responsive."""
+        self._busy = True
+        done = threading.Event()
+        box = []
+
+        def worker():
+            try:
+                box.append(action())
+            except Exception as exc:  # noqa: BLE001 - never let the loop crash
+                box.append((False, "Action failed: %s" % exc, "red"))
+            done.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        if done.wait(self._DISPATCH_GRACE):
+            _ok, msg, style = box[0]
+            self.show(msg, style)
+            self._busy = False
+        else:
+            self._pending_done = done
+            self._pending_box = box
+            self._pending_thread = thread
+
+    def _poll_pending(self) -> None:
+        """Drain a still-running _dispatch() action; called every render
+        tick. A no-op unless something is in flight and has just finished."""
+        if self._pending_done is not None and self._pending_done.is_set():
+            _ok, msg, style = self._pending_box[0]
+            self.show(msg, style)
+            self._busy = False
+            self._pending_done = None
+            self._pending_box = None
+            self._pending_thread = None
+
     # -- event handling --------------------------------------------------
     def handle_event(self, event) -> None:
         if isinstance(event, MouseEvent):
@@ -1392,14 +1599,26 @@ class Dashboard:
             self.ui.mode = "normal"
             action = self._pending_action
             self._pending_action = None
+            prompt = self.ui.pending_prompt
             self.ui.pending_prompt = ""
-            if key == "enter" and action is not None:
-                _ok, msg, style = action()
-                self.show(msg, style)
+            # Below the minimum terminal height the prompt text itself was
+            # never drawn (Rich clips footer rows short) — Enter must not
+            # blindly act on a question the user could not have read.
+            can_act = self.size[1] >= MIN_TERMINAL_HEIGHT
+            if key == "enter" and action is not None and can_act:
+                self.show(prompt.rstrip("?") + "…", "grey")
+                self._dispatch(action)
             else:
                 self.show("Cancelled.", "grey")
             return
         if mode == "quit":
+            if self.size[1] < MIN_TERMINAL_HEIGHT:
+                # Same reasoning as the confirm guard above: the three-way
+                # question wasn't visible, so only the safe "stay" reading
+                # of Esc is honoured; anything else is ignored outright.
+                if key == "esc":
+                    self.ui.mode = "normal"
+                return
             if key == "enter":
                 self.manager.shutdown()
                 self.exit_note = "Stopped all services."
@@ -1444,7 +1663,12 @@ class Dashboard:
         elif key == "?":
             self.ui.mode = "help"
         elif key == "q":
-            if self.manager.any_owned():
+            if self._busy:
+                # A confirmed action is still finishing on a worker thread;
+                # letting quit's own manager.shutdown() run concurrently
+                # against the same services would race with it.
+                self.show("Still finishing the previous action — try again in a moment.", "grey")
+            elif self.manager.any_owned():
                 self.ui.mode = "quit"
             else:
                 self.running = False  # nothing running: quit quietly
@@ -1461,6 +1685,11 @@ class Dashboard:
             return
         if self.ui.mode != "normal":
             return  # confirmations are keyboard-only, clicks never skip them
+        if self.size[1] < MIN_TERMINAL_HEIGHT:
+            # Below this height the button row isn't where the static
+            # BUTTON_ROW_FROM_BOTTOM arithmetic assumes (Rich clips footer
+            # rows), so hit-testing against it would land on the wrong text.
+            return
         if TABLE_ROW_Y0 <= event.y < TABLE_ROW_Y0 + len(SERVICE_ORDER):
             self.ui.selected = event.y - TABLE_ROW_Y0
             self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
@@ -1474,6 +1703,9 @@ class Dashboard:
 
     # -- button actions --------------------------------------------------
     def _activate(self, idx: int) -> None:
+        if self._busy:
+            self.show("Still finishing the previous action…", "grey")
+            return
         btn = BUTTONS[idx]
         name = SERVICE_ORDER[self.ui.selected]
         title = name.capitalize()
@@ -1566,7 +1798,14 @@ class Dashboard:
             raise KeyboardInterrupt
 
         old_handlers = []
-        for signame in ("SIGINT", "SIGTERM"):
+        # SIGHUP: the terminal closing/dropping sends this to azctl (the
+        # Azurite children are in their own session via start_new_session
+        # and never see it themselves) — without a handler here, Python's
+        # default disposition kills the process instantly and this whole
+        # try/finally never runs, orphaning every running service. Routing
+        # it through the same KeyboardInterrupt path as SIGINT/SIGTERM makes
+        # the finally block's manager.shutdown() run on terminal close too.
+        for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
             signum = getattr(signal, signame, None)
             if signum is None:
                 continue
@@ -1590,24 +1829,33 @@ class Dashboard:
                         self.handle_event(event)
                     if not self.running:
                         break
+                    self._poll_pending()
                     if tick % 3 == 0:
                         transitions = self.manager.refresh()
-                        if any(t.new == BROKEN for t in transitions):
+                        broken = [t for t in transitions if t.new == BROKEN]
+                        if broken:
                             try:
                                 console.file.write("\a")
                                 console.file.flush()
                             except (OSError, ValueError):
                                 pass
+                            for t in broken:
+                                reason = self.manager.broken_reason(t.service)
+                                if reason:
+                                    self.show(reason, "red")
                     width, height = console.size
                     self.size = (width, height)
-                    if self.ui.combined_logs:
-                        lines = self.manager.logs.merged()
+                    if height < MIN_TERMINAL_HEIGHT:
+                        live.update(render_too_small(height), refresh=True)
                     else:
-                        lines = self.manager.logs.lines(SERVICE_ORDER[self.ui.selected])
-                    live.update(
-                        build_frame(self.config, self.manager.views(), lines, self.ui, height, self.clock()),
-                        refresh=True,
-                    )
+                        if self.ui.combined_logs:
+                            lines = self.manager.logs.merged()
+                        else:
+                            lines = self.manager.logs.lines(SERVICE_ORDER[self.ui.selected])
+                        live.update(
+                            build_frame(self.config, self.manager.views(), lines, self.ui, height, self.clock()),
+                            refresh=True,
+                        )
                     time.sleep(0.1)
                     tick += 1
         except KeyboardInterrupt:
@@ -1616,6 +1864,18 @@ class Dashboard:
         finally:
             reader.stop()
             if not self.detached:
+                # A second SIGINT/SIGTERM/SIGHUP arriving while shutdown() is
+                # blocked inside a per-service kill_pid() wait would otherwise
+                # raise KeyboardInterrupt again right here, aborting the loop
+                # over SERVICE_ORDER mid-way and orphaning whatever hadn't
+                # been reached yet. Ignore further interrupts for the
+                # duration of cleanup; original handlers are restored
+                # unconditionally right after, whichever way this goes.
+                for signum, _old in old_handlers:
+                    try:
+                        signal.signal(signum, signal.SIG_IGN)
+                    except (ValueError, OSError):
+                        pass
                 self.manager.shutdown()
             for signum, old in old_handlers:
                 try:
@@ -1661,10 +1921,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Read-only/informational commands that already have a complete stdlib+psutil
+# fallback path (cmd_status/_print_plain_status, cmd_watch, cmd_free_ports are
+# all _HAVE_DEPS-guarded; free-ports degrades to "could not be identified"
+# without psutil rather than crashing) — these must work even when rich and
+# psutil haven't been bootstrapped yet, per BEHAVIOR.md's "read-only view I
+# can run anywhere ... without any chance of disturbing what is running".
+_NO_DEPS_COMMANDS = ("status", "watch", "free-ports")
+
+
+def command_needs_deps(command) -> bool:
+    """False for the read-only commands (and argparse's own --help, which
+    exits before this is ever consulted); True for everything else,
+    including the dashboard/`up` (both need rich)."""
+    return command not in _NO_DEPS_COMMANDS
+
+
 def main(argv=None) -> int:
-    if not _HAVE_DEPS:
-        _bootstrap_and_reexec()  # installs deps and re-execs; never returns
+    # Parse argv first: argparse is stdlib-only, so --help and the read-only
+    # commands can be served without ever needing rich/psutil to be
+    # importable. Only commands that actually need rich trigger the
+    # network-touching bootstrap.
     args = build_parser().parse_args(argv)
+    if not _HAVE_DEPS and command_needs_deps(args.command):
+        _bootstrap_and_reexec()  # installs deps and re-execs; never returns
     file_dict = load_config(config_path(os.environ, os.path.expanduser("~"), os.name == "nt"))
     config = resolve_config(args, file_dict)
     if args.command == "status":

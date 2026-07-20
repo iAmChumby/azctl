@@ -151,6 +151,20 @@ def test_footer_combined_indicator():
     assert "logs: ALL" in out
 
 
+def test_footer_mode_indicator_survives_truncation_at_normal_widths():
+    """BEHAVIOR.md: 'The footer shows whether this mode is on or off, so you
+    always know which view you are reading.' At the two most common default
+    terminal widths (80, 100) the old ordering put the indicator after ~102
+    chars of static hint text, so the no_wrap+ellipsis line truncated it away
+    identically whether combined_logs was True or False."""
+    for width in (80, 100):
+        off = export(azctl.render_footer(azctl.UIState(combined_logs=False), now=0.0), width=width)
+        on = export(azctl.render_footer(azctl.UIState(combined_logs=True), now=0.0), width=width)
+        assert "logs: selected" in off, width
+        assert "logs: ALL" in on, width
+        assert off != on, width
+
+
 def test_help_overlay_lists_every_key_and_button():
     out = export(azctl.render_help())
     for key in ("Enter", "a", "t", "c", "S", "?", "q", "Esc", "mouse"):

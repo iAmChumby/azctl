@@ -306,6 +306,46 @@ def test_mouse_release_and_out_of_bounds_ignored():
     assert d.ui.selected == 0 and d.ui.message is None
 
 
+def test_mouse_click_ignored_below_minimum_terminal_height():
+    """Below MIN_TERMINAL_HEIGHT the button row isn't where the static
+    hit-testing arithmetic assumes (Rich clips footer rows short), so a
+    click there must not fire a button at all."""
+    d = dash(owned=("blob",))
+    d.size = (100, azctl.MIN_TERMINAL_HEIGHT - 1)
+    _, x0, x1 = azctl.button_spans()[1]  # Stop
+    y = d.size[1] - azctl.BUTTON_ROW_FROM_BOTTOM
+    d.handle_event(azctl.MouseEvent(x=(x0 + x1) // 2, y=y, pressed=True))
+    assert d.ui.mode == "normal"
+    assert ("stop", "blob") not in d.manager.calls
+
+
+def test_enter_on_confirm_is_ignored_below_minimum_terminal_height():
+    """The confirmation question itself wouldn't have been drawn on a
+    too-short terminal — Enter must not blindly act on a prompt the user
+    could not have read (a stop/kill happening with zero visible warning)."""
+    d = dash(owned=("blob",))
+    d.ui.button = 1  # Stop
+    key(d, "enter")  # opens the confirm prompt
+    assert d.ui.mode == "confirm"
+    d.size = (80, azctl.MIN_TERMINAL_HEIGHT - 1)
+    key(d, "enter")  # would normally confirm; must be treated as cancel
+    assert d.ui.mode == "normal"
+    assert d.ui.message[0] == "Cancelled."
+    assert ("stop", "blob") not in d.manager.calls
+
+
+def test_quit_prompt_ignored_below_minimum_terminal_height():
+    d = dash(owned=("blob",))
+    key(d, "q")
+    assert d.ui.mode == "quit"
+    d.size = (80, azctl.MIN_TERMINAL_HEIGHT - 1)
+    key(d, "enter")  # would normally stop everything and quit
+    assert d.ui.mode == "quit" and d.running is True
+    assert ("shutdown",) not in d.manager.calls
+    key(d, "esc")  # the one response still honoured: stay
+    assert d.ui.mode == "normal" and d.running is True
+
+
 def test_ctrl_c_exits():
     d = dash(owned=("blob",))
     key(d, "ctrl-c")

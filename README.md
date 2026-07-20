@@ -75,7 +75,7 @@ Nothing in this tool can touch stored data. It manages *whether the services run
 - **Config file + flags** — custom ports, host, data directory via `~/.config/azctl/config.json` or `--blob-port`-style flags.
 - **Mouse support** — click a row to select it, click a button to run it.
 - **Terminal bell on failure** — an audible cue the moment a service flips to broken, so you notice even when the window isn't focused.
-- **Save all** — one keystroke (`S`) writes the merged, colour-tagged log of all three services to a single file.
+- **Save all** — one keystroke (`S`) writes the merged log of all three services, each line tagged with its service name and timestamp, to a single plain-text file (`azurite-all.log`).
 - **Version line** — the header shows the Azurite and Node versions actually in use, so "works on my machine" arguments end faster.
 - **Timestamps toggle** (`t`) — prefix every log line with its arrival time.
 

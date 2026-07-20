@@ -231,6 +231,52 @@ def test_missing_node_runtime_is_a_clear_red_message(tmp_path):
     assert not ok and style == "red" and "Node" in msg
 
 
+def test_node_missing_exit_127_is_reported_not_a_silent_broken(tmp_path):
+    """The realistic 'Node missing' shape: a real npm-installed azurite-*
+    binary is a `#!/usr/bin/env node` shebang script. The kernel execs
+    `/usr/bin/env` fine (Popen never raises FileNotFoundError) and only
+    `env` itself fails to resolve `node`, so the child exits 127 within
+    milliseconds. This must not be silently swallowed into a generic,
+    unexplained BROKEN with no red message anywhere (BEHAVIOR.md: 'the
+    supporting runtime is missing ... a clear red message')."""
+    cfg = make_config(azctl, tmp_path)
+    mgr = azctl.ServiceManager(
+        cfg,
+        command_for=lambda name, config: [sys.executable, "-c", "import sys; sys.exit(127)"],
+        health_timeout=0.05,
+    )
+    mgr.start("blob")
+    mgr._svcs["blob"].proc.wait(timeout=10)
+    assert refreshed_state(mgr, "blob") == azctl.BROKEN
+    assert view_of(mgr, "blob").exit_code == 127
+    reason = mgr.broken_reason("blob")
+    assert reason is not None
+    assert "Node" in reason and "npm install -g azurite" in reason
+    # Sticky like the rest of the BROKEN-death record.
+    assert refreshed_state(mgr, "blob") == azctl.BROKEN
+    assert mgr.broken_reason("blob") == reason
+    # Stop clears it, same as it clears exit_code/launched_at.
+    mgr.stop("blob")
+    assert mgr.broken_reason("blob") is None
+
+
+def test_death_with_a_non_127_exit_code_has_no_broken_reason(tmp_path):
+    """A generic crash (any other exit code) stays a plain, unexplained
+    BROKEN — broken_reason is specifically for the Node-missing shape, not a
+    catch-all message for every death."""
+    cfg = make_config(azctl, tmp_path)
+    mgr = azctl.ServiceManager(
+        cfg,
+        command_for=lambda name, config: [sys.executable, "-c", DIER_SCRIPT],
+        health_timeout=0.05,
+    )
+    mgr.start("table")
+    mgr._svcs["table"].proc.wait(timeout=10)
+    assert refreshed_state(mgr, "table") == azctl.BROKEN
+    assert view_of(mgr, "table").exit_code == 3
+    assert mgr.broken_reason("table") is None
+
+
 # --- lifecycle: restart, uptime ------------------------------------------
 
 
@@ -548,6 +594,36 @@ def test_save_merged_log_is_tagged_and_in_arrival_order(tmp_path):
     assert lines[2].endswith("[blob] b-third")
 
 
+def test_save_service_log_survives_a_deleted_cwd(monkeypatch, tmp_path):
+    """os.getcwd() itself raises FileNotFoundError when the directory azctl
+    was launched from has since been removed (rm -rf'd workdir, branch
+    switch that dropped it, a cleaned-up tmp dir). Save must still fail with
+    the usual red message, not an unhandled traceback."""
+    cfg = make_config(azctl, tmp_path)
+    mgr = azctl.ServiceManager(cfg, command_for=lambda name, config: None)
+    mgr.logs.append("blob", "a line")
+
+    def boom():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(azctl.os, "getcwd", boom)
+    ok, msg, style = mgr.save_service_log("blob")  # directory=None -> os.getcwd()
+    assert not ok and style == "red" and "Could not" in msg
+
+
+def test_save_merged_log_survives_a_deleted_cwd(monkeypatch, tmp_path):
+    cfg = make_config(azctl, tmp_path)
+    mgr = azctl.ServiceManager(cfg, command_for=lambda name, config: None)
+    mgr.logs.append("blob", "a line")
+
+    def boom():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(azctl.os, "getcwd", boom)
+    ok, msg, style = mgr.save_merged_log()
+    assert not ok and style == "red" and "Could not" in msg
+
+
 # --- connection strings ---------------------------------------------------
 
 
@@ -642,6 +718,67 @@ def test_config_path_respects_xdg_and_appdata():
     )
     windows = azctl.config_path({"APPDATA": "/appdata"}, "/home/u", True)
     assert windows == pathlib.Path("/appdata") / "azctl" / "config.json"
+
+
+# --- Windows npm .cmd shim (cross-platform spawn correctness) -------------
+
+
+def test_default_command_wraps_a_windows_cmd_shim(monkeypatch, tmp_path):
+    """npm installs azurite-blob.cmd (a batch wrapper) on Windows instead of
+    a native exe. subprocess.Popen with shell=False can't exec a .cmd file
+    directly (WinError 193) — it must be run through `cmd /c`, the same
+    trick Node's own cross-spawn uses for this exact npm-shim problem."""
+    monkeypatch.setattr(azctl.os, "name", "nt")
+    monkeypatch.setattr(
+        azctl.shutil, "which",
+        lambda exe: r"C:\npm\azurite-blob.cmd" if exe == "azurite-blob" else None,
+    )
+    cfg = make_config(azctl, tmp_path)
+    cmd = azctl.default_command_for("blob", cfg)
+    assert cmd[:2] == ["cmd", "/c"]
+    assert cmd[2].lower().endswith("azurite-blob.cmd")
+    assert "--blobHost" in cmd
+
+
+def test_default_command_does_not_wrap_a_posix_binary(monkeypatch, tmp_path):
+    monkeypatch.setattr(azctl.os, "name", "posix")
+    monkeypatch.setattr(
+        azctl.shutil, "which",
+        lambda exe: "/usr/local/bin/azurite-blob" if exe == "azurite-blob" else None,
+    )
+    cfg = make_config(azctl, tmp_path)
+    cmd = azctl.default_command_for("blob", cfg)
+    assert cmd[0] == "/usr/local/bin/azurite-blob"
+    assert cmd[:2] != ["cmd", "/c"]
+
+
+def test_default_command_does_not_wrap_a_windows_exe(monkeypatch, tmp_path):
+    """Only .cmd/.bat shims need the wrapper; a native .exe must not be."""
+    monkeypatch.setattr(azctl.os, "name", "nt")
+    monkeypatch.setattr(
+        azctl.shutil, "which",
+        lambda exe: r"C:\npm\azurite-blob.exe" if exe == "azurite-blob" else None,
+    )
+    cfg = make_config(azctl, tmp_path)
+    cmd = azctl.default_command_for("blob", cfg)
+    assert cmd[0] == r"C:\npm\azurite-blob.exe"
+
+
+def test_run_version_wraps_a_windows_cmd_shim(monkeypatch):
+    monkeypatch.setattr(azctl.os, "name", "nt")
+    monkeypatch.setattr(
+        azctl.shutil, "which", lambda exe: r"C:\npm\node.cmd" if exe == "node" else None
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="v20.0.0\n", stderr="")
+
+    monkeypatch.setattr(azctl.subprocess, "run", fake_run)
+    assert azctl._run_version("node") == "v20.0.0"
+    assert captured["cmd"][:2] == ["cmd", "/c"]
+    assert captured["cmd"][2] == r"C:\npm\node.cmd"
 
 
 # --- real azurite (only when installed) -----------------------------------

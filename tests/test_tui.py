@@ -9,10 +9,15 @@ manager, and a StringIO console, and exits after two bounded iterations.
 
 import base64
 import io
+import os
 import queue
 import re
+import signal
+import sys
+import threading
 import time
 
+import pytest
 from rich.console import Console
 
 import azctl
@@ -120,6 +125,9 @@ class FakeManager:
 
     def notice_external_kill(self, name):
         self.calls.append(("notice_external_kill", name))
+
+    def broken_reason(self, name):
+        return None
 
 
 def key(name):
@@ -725,6 +733,172 @@ def test_no_bell_without_broken_transition(monkeypatch):
     manager = _TransitionManager([azctl.Transition("blob", azctl.STARTING, azctl.RUNNING)])
     output = _run_bounded_dashboard(monkeypatch, manager)
     assert "\a" not in output
+
+
+class _ReasonManager(_TransitionManager):
+    """Like _TransitionManager, but reports a distinguishing BROKEN reason —
+    the Node-missing message must reach the footer via the same refresh
+    cycle that rings the bell, not just via a synchronous Start press."""
+
+    def broken_reason(self, name):
+        return "Node.js runtime not found — install Node, then npm install -g azurite"
+
+
+def test_broken_transition_with_reason_shows_the_red_message(monkeypatch):
+    manager = _ReasonManager([azctl.Transition("blob", azctl.STARTING, azctl.BROKEN)])
+    output = _run_bounded_dashboard(monkeypatch, manager)
+    assert "\a" in output
+    assert "Node.js runtime not found" in output
+
+
+def test_run_loop_shows_too_small_message_below_minimum_height(monkeypatch):
+    manager = FakeManager()
+    sink = io.StringIO()
+    console = Console(file=sink, force_terminal=True, width=80, height=azctl.MIN_TERMINAL_HEIGHT - 1)
+    monkeypatch.setattr(azctl, "Console", lambda: console)
+    monkeypatch.setattr(azctl, "make_input_reader", _FakeReader)
+    monkeypatch.setattr(azctl, "detect_versions", lambda: ("unknown", "unknown"))
+    dash = azctl.Dashboard(azctl.Config(), manager)
+    assert dash.run() == 0
+    out = sink.getvalue()
+    assert "too small" in out
+    assert "[Start]" not in out
+
+
+# --- signal handling: SIGHUP / re-entrant SIGTERM during shutdown -------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal delivery only")
+def test_sighup_triggers_clean_shutdown(monkeypatch):
+    """BEHAVIOR.md: closing the terminal (SIGHUP) must shut services down
+    cleanly, not orphan them. Reproduced by delivering a real SIGHUP to this
+    process while Dashboard.run() is alive; the finally block's
+    manager.shutdown() must run instead of the interpreter dying silently."""
+
+    class _NeverReader:
+        def __init__(self):
+            self.events = queue.Queue()
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    manager = FakeManager(owned={"blob"})
+    sink = io.StringIO()
+    console = Console(file=sink, force_terminal=True, width=80, height=24)
+    monkeypatch.setattr(azctl, "Console", lambda: console)
+    monkeypatch.setattr(azctl, "make_input_reader", _NeverReader)
+    monkeypatch.setattr(azctl, "detect_versions", lambda: ("unknown", "unknown"))
+    dash = azctl.Dashboard(azctl.Config(), manager)
+
+    def send_hup():
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGHUP)
+
+    threading.Thread(target=send_hup, daemon=True).start()
+    assert dash.run() == 0
+    assert ("shutdown",) in manager.calls
+    assert dash.exit_note == "Interrupted — stopped all services."
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal delivery only")
+def test_second_sigterm_during_shutdown_does_not_abort_it(monkeypatch):
+    """A second SIGINT/SIGTERM arriving while shutdown() is mid-flight (e.g.
+    a impatient double Ctrl-C, or systemd's TERM-then-KILL pattern) must not
+    raise KeyboardInterrupt a second time inside the finally block and abort
+    the cleanup loop before every service has been stopped."""
+
+    class _SlowShutdownManager(FakeManager):
+        def __init__(self, owned=(), delay=0.4):
+            FakeManager.__init__(self, owned)
+            self.delay = delay
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            time.sleep(self.delay)
+            self.calls.append(("shutdown",))
+            self.owned.clear()
+
+    class _NeverReader:
+        def __init__(self):
+            self.events = queue.Queue()
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    manager = _SlowShutdownManager(owned={"blob", "queue"}, delay=0.4)
+    sink = io.StringIO()
+    console = Console(file=sink, force_terminal=True, width=80, height=24)
+    monkeypatch.setattr(azctl, "Console", lambda: console)
+    monkeypatch.setattr(azctl, "make_input_reader", _NeverReader)
+    monkeypatch.setattr(azctl, "detect_versions", lambda: ("unknown", "unknown"))
+    dash = azctl.Dashboard(azctl.Config(), manager)
+
+    def send_signals():
+        time.sleep(0.15)
+        os.kill(os.getpid(), signal.SIGTERM)  # -> KeyboardInterrupt -> finally/shutdown()
+        time.sleep(0.15)  # lands mid-shutdown (delay=0.4s)
+        os.kill(os.getpid(), signal.SIGTERM)  # must be ignored, not abort cleanup
+
+    threading.Thread(target=send_signals, daemon=True).start()
+    assert dash.run() == 0
+    assert manager.shutdown_calls == 1  # ran exactly once, to completion
+    assert ("shutdown",) in manager.calls  # the loop over SERVICE_ORDER finished
+
+
+# --- async dispatch of confirmed actions (no UI freeze) ------------------
+
+
+def test_slow_confirm_action_does_not_block_handle_event():
+    """A real Stop/Restart/Free-port confirm can block for seconds inside
+    kill_pid()'s wait; handle_event() must return almost immediately and let
+    the result arrive later instead of freezing the render/input loop."""
+
+    class _SlowManager(FakeManager):
+        def stop(self, name):
+            time.sleep(1.0)
+            self.calls.append(("stop", name))
+            self.owned.discard(name)
+            return True, "Stopped %s." % name.capitalize(), "green"
+
+    dash = make_dashboard(_SlowManager(owned={"blob"}))
+    dash._activate(1)  # Stop -> asks
+    start = time.monotonic()
+    dash.handle_event(key("enter"))  # confirms
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5, "handle_event blocked on a slow action (%.3fs)" % elapsed
+    assert dash.ui.message[1] == "grey"  # immediate interim message
+    assert ("stop", "blob") not in dash.manager.calls  # still running in the background
+    assert wait_for(lambda: ("stop", "blob") in dash.manager.calls, timeout=3)
+    assert wait_for(lambda: dash._pending_done is not None and dash._pending_done.is_set(), timeout=3)
+    dash._poll_pending()  # what the run() loop does every tick
+    assert dash.ui.message[0] == "Stopped Blob."
+
+
+def test_busy_guard_prevents_duplicate_dispatch_while_action_in_flight():
+    class _SlowManager(FakeManager):
+        def stop(self, name):
+            time.sleep(0.3)
+            self.calls.append(("stop", name))
+            self.owned.discard(name)
+            return True, "Stopped %s." % name.capitalize(), "green"
+
+    dash = make_dashboard(_SlowManager(owned={"blob"}))
+    dash._activate(1)
+    dash.handle_event(key("enter"))
+    assert dash._busy is True
+    dash._activate(1)  # try to Stop again while the first Stop is still running
+    assert dash.ui.mode == "normal"  # did not re-ask for confirmation
+    assert "finishing" in dash.ui.message[0]
+    # Simulate the run() loop's per-tick drain until the background stop()
+    # finishes and clears the busy flag.
+    assert wait_for(lambda: (dash._poll_pending(), not dash._busy)[1], timeout=2)
 
 
 # --- three-way quit state machine ---------------------------------------

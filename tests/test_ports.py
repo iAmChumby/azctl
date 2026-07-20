@@ -90,6 +90,39 @@ def test_kill_pid_of_a_gone_process_is_success():
     assert azctl.kill_pid(proc.pid) is True
 
 
+def test_kill_pid_swallows_access_denied(monkeypatch):
+    """psutil raises AccessDenied (distinct from NoSuchProcess) when the
+    caller lacks permission to signal/introspect a process — the realistic
+    shape of Free-port aimed at a root-owned process on a shared machine.
+    Only NoSuchProcess was ever caught here; an uncaught AccessDenied would
+    propagate out of kill_pid() and crash the whole dashboard."""
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=True):
+            raise azctl.psutil.AccessDenied(self.pid)
+
+        def terminate(self):
+            raise azctl.psutil.AccessDenied(self.pid)
+
+        def kill(self):
+            raise azctl.psutil.AccessDenied(self.pid)
+
+    monkeypatch.setattr(azctl.psutil, "Process", lambda pid: FakeProc(pid))
+    monkeypatch.setattr(azctl.psutil, "wait_procs", lambda procs, timeout: ([], procs))
+    assert azctl.kill_pid(12345) is True  # never raises
+
+
+def test_kill_pid_swallows_access_denied_on_process_lookup(monkeypatch):
+    def raise_denied(pid):
+        raise azctl.psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(azctl.psutil, "Process", raise_denied)
+    assert azctl.kill_pid(12345) is True  # never raises
+
+
 def test_observe_is_honest_about_ownership():
     port = free_port()
     proc = spawn_listener(port)
