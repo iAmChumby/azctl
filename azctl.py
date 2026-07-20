@@ -19,6 +19,7 @@ import itertools
 import json
 import os
 import pathlib
+import queue
 import shutil
 import signal
 import socket
@@ -168,15 +169,17 @@ def _bootstrap_and_reexec() -> None:
 # --- guarded third-party import ----------------------------------------- §3
 try:
     import psutil
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.layout import Layout
     from rich.live import Live
+    from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
 
     _HAVE_DEPS = True
 except ImportError:
     psutil = None
-    Console = Live = Table = Text = None
+    Console = Group = Layout = Live = Panel = Table = Text = None
     _HAVE_DEPS = False
 
 
@@ -512,6 +515,14 @@ class ServiceManager:
             svc = self._svcs[name]
             if svc.proc is not None and svc.proc.poll() is None:
                 self.stop(name)
+
+    def owns_live(self, name: str) -> bool:
+        """True while we own a live child process for this service."""
+        svc = self._svcs[name]
+        return svc.proc is not None and svc.proc.poll() is None
+
+    def any_owned(self) -> bool:
+        return any(self.owns_live(name) for name in SERVICE_ORDER)
 
     def detach_all(self) -> None:
         """Forget our children without killing them (quit-and-leave-running)."""
@@ -862,11 +873,758 @@ def cmd_free_ports(config: Config, assume_yes: bool = False, service=None) -> in
     return 0 if all_free else 1
 
 
-# ===== TUI ============================================================== §9-10
-# The interactive dashboard lives here: input readers (termios/tty+select on
-# POSIX, msvcrt on Windows), the SGR mouse parser, UIState, the pure render
-# functions, and the rich Live loop with buttons/confirmations/help overlay.
-# Everything above this banner is engine + CLI and fully functional without it.
+# --- input: events, escape/SGR parser, POSIX & Windows readers ---------- §9
+@dataclass
+class KeyEvent:
+    key: str
+
+
+@dataclass
+class MouseEvent:
+    x: int
+    y: int
+    pressed: bool
+
+
+_ARROWS = {ord("A"): "up", ord("B"): "down", ord("C"): "right", ord("D"): "left"}
+
+
+def _parse_sgr_mouse(body: bytes, final: int) -> "MouseEvent | None":
+    """body is the bytes after '<' in ESC [ < btn ; x ; y (M|m)."""
+    parts = body.split(b";")
+    if len(parts) != 3:
+        return None
+    try:
+        btn, x, y = (int(p) for p in parts)
+    except ValueError:
+        return None
+    if btn != 0:  # only plain left-button events; wheel/drag parsed-and-dropped
+        return None
+    return MouseEvent(x, y, final == ord("M"))
+
+
+def parse_bytes(buf: bytes) -> "tuple[list, bytes]":
+    """Pure incremental key/mouse parser. Returns (events, unconsumed tail).
+
+    The tail is non-empty only for a trailing incomplete escape sequence;
+    the POSIX reader flushes a lone trailing ESC as an 'esc' key after 50 ms.
+    """
+    events = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        byte = buf[i]
+        if byte == 0x1B:
+            if i + 1 >= n:
+                break  # lone ESC at end: keep as remainder
+            nxt = buf[i + 1]
+            if nxt == ord("["):
+                j = i + 2
+                while j < n and not (0x40 <= buf[j] <= 0x7E):
+                    j += 1
+                if j >= n:
+                    break  # incomplete CSI: keep as remainder
+                final = buf[j]
+                body = buf[i + 2 : j]
+                if final in _ARROWS and not body:
+                    events.append(KeyEvent(_ARROWS[final]))
+                elif final in (ord("M"), ord("m")) and body.startswith(b"<"):
+                    mouse = _parse_sgr_mouse(body[1:], final)
+                    if mouse is not None:
+                        events.append(mouse)
+                # any other CSI: consumed and dropped, never leaks as junk keys
+                i = j + 1
+                continue
+            if nxt == ord("O"):  # SS3 arrows (application cursor mode)
+                if i + 2 >= n:
+                    break
+                if buf[i + 2] in _ARROWS:
+                    events.append(KeyEvent(_ARROWS[buf[i + 2]]))
+                i += 3
+                continue
+            events.append(KeyEvent("esc"))
+            i += 1
+            continue
+        if byte in (0x0D, 0x0A):
+            events.append(KeyEvent("enter"))
+        elif byte == 0x03:
+            events.append(KeyEvent("ctrl-c"))
+        elif 0x20 <= byte <= 0x7E:
+            events.append(KeyEvent(chr(byte)))  # case-sensitive: 'S' != 's'
+        i += 1
+    return events, buf[i:]
+
+
+class PosixInputReader:
+    """cbreak keyboard + SGR mouse reporting on a POSIX tty."""
+
+    def __init__(self) -> None:
+        self.events = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = None
+        self._saved = None
+        self._fd = None
+
+    @staticmethod
+    def _write_ctl(seq: str) -> None:
+        try:
+            sys.__stdout__.write(seq)
+            sys.__stdout__.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def start(self) -> None:
+        import termios
+        import tty
+
+        self._fd = sys.stdin.fileno()
+        self._saved = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        self._write_ctl("\x1b[?1002h\x1b[?1006h")  # mouse presses, SGR encoding
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        import select
+
+        pending = b""
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    data = os.read(self._fd, 128)
+                except OSError:
+                    break
+                if not data:
+                    break
+                pending += data
+                parsed, pending = parse_bytes(pending)
+                for event in parsed:
+                    self.events.put(event)
+            elif pending == b"\x1b":
+                # ESC with no continuation for 50 ms: it was the Esc key.
+                self.events.put(KeyEvent("esc"))
+                pending = b""
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self._write_ctl("\x1b[?1006l\x1b[?1002l")
+        if self._saved is not None:
+            import termios
+
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+            except termios.error:
+                pass
+            self._saved = None
+
+
+class WindowsInputReader:
+    """msvcrt polling reader. No mouse on Windows — silently absent."""
+
+    def __init__(self) -> None:
+        self.events = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        import msvcrt
+
+        prefix_map = {"H": "up", "P": "down", "K": "left", "M": "right"}
+        while not self._stop.is_set():
+            if not msvcrt.kbhit():
+                time.sleep(0.02)
+                continue
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                key = prefix_map.get(msvcrt.getwch())
+                if key:
+                    self.events.put(KeyEvent(key))
+            elif ch in ("\r", "\n"):
+                self.events.put(KeyEvent("enter"))
+            elif ch == "\x1b":
+                self.events.put(KeyEvent("esc"))
+            elif ch == "\x03":
+                self.events.put(KeyEvent("ctrl-c"))
+            elif " " <= ch <= "~":
+                self.events.put(KeyEvent(ch))
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
+def make_input_reader():
+    if os.name == "nt":
+        return WindowsInputReader()
+    return PosixInputReader()
+
+
+# --- TUI: UIState, pure render functions, Dashboard loop ---------------- §10
+@dataclass
+class Button:
+    label: str
+    action: str
+    danger: bool
+    group: int
+
+
+BUTTONS = (
+    Button("Start", "start", False, 0),
+    Button("Stop", "stop", True, 0),
+    Button("Restart", "restart", True, 0),
+    Button("Save", "save", False, 0),
+    Button("Free port", "free_port", True, 0),
+    Button("Start all", "start_all", False, 1),
+    Button("Stop all", "stop_all", True, 1),
+)
+
+GROUP_SEPARATOR = " │ "
+
+# Fixed layout arithmetic (1-based terminal rows) — the single source of
+# truth shared by the renderer and mouse hit-testing.
+HEADER_SIZE = 3
+TABLE_SIZE = 5
+FOOTER_SIZE = 4
+TABLE_ROW_Y0 = HEADER_SIZE + 2       # first service row (heading sits above it)
+BUTTON_ROW_FROM_BOTTOM = 2           # button bar row = height - 2
+
+MSG_STYLES = {"green": "green", "red": "bold red", "yellow": "yellow", "grey": "grey50"}
+
+
+@dataclass
+class UIState:
+    selected: int = 0
+    button: int = 0
+    mode: str = "normal"  # normal | confirm | quit | help | conn
+    pending_prompt: str = ""
+    combined_logs: bool = False
+    timestamps: bool = False
+    message: "tuple | None" = None  # (text, style, expires_at)
+    versions: "tuple" = ("unknown", "unknown")
+
+
+def button_spans() -> "list[tuple[int, int, int]]":
+    """(index, x0, x1) 1-based column span of each rendered [Button] token."""
+    spans = []
+    x = 1
+    for i, btn in enumerate(BUTTONS):
+        if i == 0:
+            sep = ""
+        elif BUTTONS[i - 1].group != btn.group:
+            sep = GROUP_SEPARATOR
+        else:
+            sep = " "
+        x += len(sep)
+        token_len = len(btn.label) + 2  # [label]
+        spans.append((i, x, x + token_len - 1))
+        x += token_len
+    return spans
+
+
+def render_header(config: Config, versions) -> "Panel":
+    azurite_ver, node_ver = versions
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append("azctl", style="bold cyan")
+    text.append(" · Azurite Storage Emulator", style="bold")
+    text.append("   host %s · data %s" % (config.host, config.data_dir))
+    text.append("   azurite %s · node %s" % (azurite_ver, node_ver), style="grey50")
+    return Panel(text)
+
+
+def render_table(views, selected: int) -> "Table":
+    table = Table(box=None, show_header=True, header_style="bold", padding=(0, 1), pad_edge=False)
+    table.add_column("Service")
+    table.add_column("Status")
+    table.add_column("Port", justify="right")
+    table.add_column("PID", justify="right")
+    table.add_column("Uptime", justify="right")
+    for i, view in enumerate(views):
+        marker = "▸ " if i == selected else "  "
+        table.add_row(
+            Text(marker + view.name.capitalize(), style="bold" if i == selected else ""),
+            Text("%s %s" % (STATE_SYMBOLS[view.state], view.state), style=STATE_COLOURS[view.state]),
+            str(view.port),
+            str(view.pid) if view.pid is not None else "—",
+            format_uptime(view.uptime) if view.uptime is not None else "—",
+        )
+    return table
+
+
+def render_logs(lines, *, combined, timestamps, service, ever_started, height) -> "Panel":
+    inner = max(1, height - 2)  # panel borders
+    shown = lines[-inner:]
+    text = Text(no_wrap=True, overflow="ellipsis")
+    if not shown:
+        if combined:
+            text.append("No output from any service yet.", style="grey50")
+        elif not ever_started:
+            text.append(
+                "%s has never run. Press Enter on [Start] to launch it." % service.capitalize(),
+                style="grey50",
+            )
+        else:
+            text.append("(no output yet)", style="grey50")
+    else:
+        for line in shown:
+            if len(text) > 0:
+                text.append("\n")
+            if timestamps:
+                stamp = time.strftime("%H:%M:%S ", time.localtime(line.wall))
+                text.append(stamp, style="grey50")
+            if combined:
+                colour = SERVICE_COLOURS.get(line.service, "white")
+                text.append("[%s] " % line.service, style="bold " + colour)
+                text.append(line.text, style=colour)
+            else:
+                text.append(line.text)
+    title = "logs · all services (merged)" if combined else "logs · " + service.capitalize()
+    return Panel(text, title=title, title_align="left")
+
+
+def _legend_text() -> "Text":
+    text = Text(no_wrap=True, overflow="ellipsis")
+    for state in (RUNNING, STARTING, STOPPED, BROKEN, PORT_IN_USE):
+        if len(text) > 0:
+            text.append("   ")
+        text.append("%s %s" % (STATE_SYMBOLS[state], state), style=STATE_COLOURS[state])
+    return text
+
+
+def render_button_bar(active: int) -> "Text":
+    bar = Text(no_wrap=True, overflow="ellipsis")
+    for i, btn in enumerate(BUTTONS):
+        if i == 0:
+            sep = ""
+        elif BUTTONS[i - 1].group != btn.group:
+            sep = GROUP_SEPARATOR
+        else:
+            sep = " "
+        bar.append(sep)
+        if i == active:
+            style = "bold red reverse" if btn.danger else "bold reverse"
+        else:
+            style = "red" if btn.danger else ""
+        bar.append("[" + btn.label + "]", style=style)
+    return bar
+
+
+def render_footer(ui: UIState, now: float) -> "Group":
+    rows = [_legend_text()]
+    if ui.mode == "confirm":
+        rows.append(
+            Text(
+                ui.pending_prompt + "  — Enter: yes · Esc or any other key: cancel",
+                style="bold yellow",
+                no_wrap=True,
+                overflow="ellipsis",
+            )
+        )
+    elif ui.mode == "quit":
+        rows.append(
+            Text(
+                "Services are still running — Enter: stop them and quit · "
+                "n: leave them running and quit · Esc: stay",
+                style="bold yellow",
+                no_wrap=True,
+                overflow="ellipsis",
+            )
+        )
+    else:
+        rows.append(render_button_bar(ui.button))
+    hints = Text(
+        "↑↓ service · ←→ buttons · Enter run · a all-logs · t times · "
+        "c conn str · S save all · ? help · q quit",
+        style="grey50",
+        no_wrap=True,
+        overflow="ellipsis",
+    )
+    hints.append("   logs: ", style="grey50")
+    if ui.combined_logs:
+        hints.append("ALL", style="bold yellow")
+    else:
+        hints.append("selected", style="grey50")
+    rows.append(hints)
+    if ui.message is not None and ui.message[2] > now:
+        rows.append(
+            Text(ui.message[0], style=MSG_STYLES.get(ui.message[1], ""), no_wrap=True, overflow="ellipsis")
+        )
+    else:
+        rows.append(Text(""))
+    return Group(*rows)
+
+
+HELP_ROWS = (
+    ("↑ / ↓", "Select a service — the table marker and log panel follow instantly"),
+    ("← / →", "Move the highlight along the button bar"),
+    ("Enter", "Run the highlighted button"),
+    ("a", "Toggle the merged view of all three logs (colour-tagged, arrival order)"),
+    ("t", "Toggle timestamps on log lines"),
+    ("c", "Show connection strings and copy the selected one (OSC 52)"),
+    ("S", "Save the merged all-services log to azurite-all.log"),
+    ("?", "This help overlay"),
+    ("Esc", "Cancel a confirmation / close an overlay"),
+    ("q", "Quit — asks what to do with services that are still running"),
+    ("mouse", "Click a table row to select it; click a button to run it"),
+    ("", ""),
+    ("Start", "Start the selected service"),
+    ("Stop", "Stop the selected service (asks first)"),
+    ("Restart", "Stop then start the selected service (asks first)"),
+    ("Save", "Write the selected service's log buffer to ./azurite-<service>.log"),
+    ("Free port", "Kill whatever holds the selected service's port (asks, names it)"),
+    ("Start all", "Start all three services"),
+    ("Stop all", "Stop all three services (asks first)"),
+)
+
+
+def render_help() -> "Panel":
+    table = Table(box=None, show_header=False, padding=(0, 2, 0, 0), pad_edge=False)
+    table.add_column("key", style="bold cyan", no_wrap=True)
+    table.add_column("what it does")
+    for key, desc in HELP_ROWS:
+        table.add_row(key, desc)
+    return Panel(table, title="help — press any key to close", title_align="left")
+
+
+def render_conn(config: Config, selected: int) -> "Panel":
+    text = Text(no_wrap=True, overflow="ellipsis")
+    for i, name in enumerate(SERVICE_ORDER):
+        marker = "▸ " if i == selected else "  "
+        text.append("%s%s\n" % (marker, name.capitalize()), style="bold " + SERVICE_COLOURS[name])
+        text.append("    %s\n" % connection_string(name, config))
+    text.append(
+        "\nThe selected service's string was copied to the clipboard via OSC 52.\n"
+        "Press any key to close.",
+        style="grey50",
+    )
+    return Panel(text, title="connection strings", title_align="left")
+
+
+def build_frame(config: Config, views, log_lines, ui: UIState, height: int, now: float) -> "Layout":
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=HEADER_SIZE),
+        Layout(name="table", size=TABLE_SIZE),
+        Layout(name="logs", ratio=1),
+        Layout(name="footer", size=FOOTER_SIZE),
+    )
+    layout["header"].update(render_header(config, ui.versions))
+    layout["table"].update(render_table(views, ui.selected))
+    if ui.mode == "help":
+        layout["logs"].update(render_help())
+    elif ui.mode == "conn":
+        layout["logs"].update(render_conn(config, ui.selected))
+    else:
+        service = SERVICE_ORDER[ui.selected]
+        ever = views[ui.selected].ever_started if ui.selected < len(views) else False
+        logs_height = max(3, height - HEADER_SIZE - TABLE_SIZE - FOOTER_SIZE)
+        layout["logs"].update(
+            render_logs(
+                log_lines,
+                combined=ui.combined_logs,
+                timestamps=ui.timestamps,
+                service=service,
+                ever_started=ever,
+                height=logs_height,
+            )
+        )
+    layout["footer"].update(render_footer(ui, now))
+    return layout
+
+
+class Dashboard:
+    """Owns UIState + a ServiceManager; handle_event() is pure UI logic and
+    fully testable without a terminal. run() is the only impure part."""
+
+    def __init__(self, config: Config, manager, *, clock=time.time, sleep=time.sleep):
+        self.config = config
+        self.manager = manager
+        self.clock = clock
+        self.sleep = sleep
+        self.ui = UIState()
+        self.running = True
+        self.detached = False
+        self.exit_note = None
+        self.size = (80, 24)  # (width, height); refreshed every frame
+        self._pending_action = None
+
+    # -- messages --------------------------------------------------------
+    def show(self, text: str, style: str) -> None:
+        self.ui.message = (text, style, self.clock() + MESSAGE_TTL)
+
+    @staticmethod
+    def _aggregate(results) -> "tuple[str, str]":
+        rank = {"grey": 0, "green": 1, "yellow": 2, "red": 3}
+        style = "grey"
+        for _ok, _msg, result_style in results:
+            if rank.get(result_style, 0) > rank[style]:
+                style = result_style
+        return " ".join(msg for _ok, msg, _style in results), style
+
+    def _ask(self, prompt: str, action) -> None:
+        self.ui.mode = "confirm"
+        self.ui.pending_prompt = prompt
+        self._pending_action = action
+
+    # -- event handling --------------------------------------------------
+    def handle_event(self, event) -> None:
+        if isinstance(event, MouseEvent):
+            self._handle_mouse(event)
+            return
+        key = event.key
+        mode = self.ui.mode
+        if mode in ("help", "conn"):
+            self.ui.mode = "normal"
+            return
+        if mode == "confirm":
+            self.ui.mode = "normal"
+            action = self._pending_action
+            self._pending_action = None
+            self.ui.pending_prompt = ""
+            if key == "enter" and action is not None:
+                _ok, msg, style = action()
+                self.show(msg, style)
+            else:
+                self.show("Cancelled.", "grey")
+            return
+        if mode == "quit":
+            if key == "enter":
+                self.manager.shutdown()
+                self.exit_note = "Stopped all services."
+                self.running = False
+            elif key == "n":
+                self.manager.detach_all()
+                self.detached = True
+                self.exit_note = "Left the services running — azctl no longer owns them."
+                self.running = False
+            elif key == "esc":
+                self.ui.mode = "normal"
+            # every other key: deliberately ignored (three answers only)
+            return
+        # normal mode
+        if key in ("up", "down"):
+            step = -1 if key == "up" else 1
+            self.ui.selected = (self.ui.selected + step) % len(SERVICE_ORDER)
+            self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
+        elif key == "left":
+            self.ui.button = max(0, self.ui.button - 1)
+        elif key == "right":
+            self.ui.button = min(len(BUTTONS) - 1, self.ui.button + 1)
+        elif key == "enter":
+            self._activate(self.ui.button)
+        elif key == "a":
+            self.ui.combined_logs = not self.ui.combined_logs
+            self.show("Merged log view %s." % ("on" if self.ui.combined_logs else "off"), "grey")
+        elif key == "t":
+            self.ui.timestamps = not self.ui.timestamps
+            self.show("Timestamps %s." % ("on" if self.ui.timestamps else "off"), "grey")
+        elif key == "c":
+            name = SERVICE_ORDER[self.ui.selected]
+            copy_osc52(connection_string(name, self.config))
+            self.ui.mode = "conn"
+            self.show(
+                "Copied %s connection string to clipboard (OSC 52)." % name.capitalize(),
+                "green",
+            )
+        elif key == "S":
+            _ok, msg, style = self.manager.save_merged_log()
+            self.show(msg, style)
+        elif key == "?":
+            self.ui.mode = "help"
+        elif key == "q":
+            if self.manager.any_owned():
+                self.ui.mode = "quit"
+            else:
+                self.running = False  # nothing running: quit quietly
+        elif key == "ctrl-c":
+            if self.manager.any_owned():
+                self.exit_note = "Interrupted — stopped all services."
+            self.running = False
+
+    def _handle_mouse(self, event: MouseEvent) -> None:
+        if not event.pressed:
+            return
+        if self.ui.mode in ("help", "conn"):
+            self.ui.mode = "normal"
+            return
+        if self.ui.mode != "normal":
+            return  # confirmations are keyboard-only, clicks never skip them
+        if TABLE_ROW_Y0 <= event.y < TABLE_ROW_Y0 + len(SERVICE_ORDER):
+            self.ui.selected = event.y - TABLE_ROW_Y0
+            self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
+            return
+        if event.y == self.size[1] - BUTTON_ROW_FROM_BOTTOM:
+            for idx, x0, x1 in button_spans():
+                if x0 <= event.x <= x1:
+                    self.ui.button = idx
+                    self._activate(idx)
+                    return
+
+    # -- button actions --------------------------------------------------
+    def _activate(self, idx: int) -> None:
+        btn = BUTTONS[idx]
+        name = SERVICE_ORDER[self.ui.selected]
+        title = name.capitalize()
+        if btn.action == "start":
+            _ok, msg, style = self.manager.start(name)
+            self.show(msg, style)
+        elif btn.action == "stop":
+            if not self.manager.owns_live(name):
+                _ok, msg, style = self.manager.stop(name)  # grey "not running"
+                self.show(msg, style)
+            else:
+                self._ask("Stop %s?" % title, lambda: self.manager.stop(name))
+        elif btn.action == "restart":
+            if not self.manager.owns_live(name):
+                self.show("%s is not running — use Start." % title, "grey")
+            else:
+                self._ask("Restart %s?" % title, lambda: self.manager.restart(name))
+        elif btn.action == "save":
+            _ok, msg, style = self.manager.save_service_log(name)
+            self.show(msg, style)
+        elif btn.action == "free_port":
+            self._free_port(name)
+        elif btn.action == "start_all":
+            msg, style = self._aggregate(self.manager.start_all())
+            self.show(msg, style)
+        elif btn.action == "stop_all":
+            if not self.manager.any_owned():
+                self.show("No services are running.", "grey")
+            else:
+                self._ask("Stop all services?", self._stop_all_action)
+
+    def _stop_all_action(self) -> "tuple[bool, str, str]":
+        msg, style = self._aggregate(self.manager.stop_all())
+        return True, msg, style
+
+    def _free_port(self, name: str) -> None:
+        port = self.config.port_for(name)
+        holder = pid_on_port(port)
+        if holder is None:
+            if port_open(self.config.host, port):
+                self.show(
+                    "Port %d is in use but the owning process could not be identified." % port,
+                    "red",
+                )
+            else:
+                self.show("Nothing is listening on port %d." % port, "grey")
+            return
+        pid, pname = holder
+        if pid is None:
+            self.show(
+                "Port %d is in use but the owning process could not be identified "
+                "(try elevated privileges)." % port,
+                "red",
+            )
+            return
+        # Snapshot which pids are our own children *before* the kill, so the
+        # row can honestly flip to "stopped" if we shoot our own service.
+        owned = {}
+        for view in self.manager.views():
+            if view.pid is not None:
+                owned[view.pid] = view.name
+
+        def action():
+            def on_killed(killed_pid):
+                svc = owned.get(killed_pid)
+                if svc is not None:
+                    self.manager.notice_external_kill(svc)
+
+            return free_port_flow(
+                port,
+                lambda _prompt: True,  # this modal *is* the confirmation
+                host=self.config.host,
+                sleep=self.sleep,
+                on_killed=on_killed,
+            )
+
+        self._ask("Kill %s (PID %d) on port %d?" % (pname, pid, port), action)
+
+    # -- the live loop (the only impure part) ----------------------------
+    def run(self, start_all_on_entry: bool = False) -> int:
+        console = Console()
+        reader = make_input_reader()
+
+        def probe_versions():
+            self.ui.versions = detect_versions()
+
+        threading.Thread(target=probe_versions, daemon=True).start()
+
+        def _sig_handler(_signum, _frame):
+            raise KeyboardInterrupt
+
+        old_handlers = []
+        for signame in ("SIGINT", "SIGTERM"):
+            signum = getattr(signal, signame, None)
+            if signum is None:
+                continue
+            try:
+                old_handlers.append((signum, signal.signal(signum, _sig_handler)))
+            except (ValueError, OSError):
+                pass
+        try:
+            reader.start()
+            if start_all_on_entry:
+                msg, style = self._aggregate(self.manager.start_all())
+                self.show(msg, style)
+            with Live(console=console, screen=True, auto_refresh=False) as live:
+                tick = 0
+                while self.running:
+                    while self.running:
+                        try:
+                            event = reader.events.get_nowait()
+                        except queue.Empty:
+                            break
+                        self.handle_event(event)
+                    if not self.running:
+                        break
+                    if tick % 3 == 0:
+                        transitions = self.manager.refresh()
+                        if any(t.new == BROKEN for t in transitions):
+                            try:
+                                console.file.write("\a")
+                                console.file.flush()
+                            except (OSError, ValueError):
+                                pass
+                    width, height = console.size
+                    self.size = (width, height)
+                    if self.ui.combined_logs:
+                        lines = self.manager.logs.merged()
+                    else:
+                        lines = self.manager.logs.lines(SERVICE_ORDER[self.ui.selected])
+                    live.update(
+                        build_frame(self.config, self.manager.views(), lines, self.ui, height, self.clock()),
+                        refresh=True,
+                    )
+                    time.sleep(0.1)
+                    tick += 1
+        except KeyboardInterrupt:
+            if self.manager.any_owned():
+                self.exit_note = "Interrupted — stopped all services."
+        finally:
+            reader.stop()
+            if not self.detached:
+                self.manager.shutdown()
+            for signum, old in old_handlers:
+                try:
+                    signal.signal(signum, old)
+                except (ValueError, OSError):
+                    pass
+        if self.exit_note:
+            print(self.exit_note)
+        return 0
 
 
 def run_dashboard(config: Config, start_all_on_entry: bool = False) -> int:
@@ -876,7 +1634,9 @@ def run_dashboard(config: Config, start_all_on_entry: bool = False) -> int:
             "Try 'azctl status' for a read-only snapshot."
         )
         return 2
-    raise SystemExit("dashboard not yet implemented")
+    manager = ServiceManager(config)
+    dashboard = Dashboard(config, manager)
+    return dashboard.run(start_all_on_entry=start_all_on_entry)
 
 
 # --- main: argparse + dispatch ------------------------------------------ §11
