@@ -111,7 +111,9 @@ def test_external_listener_is_port_in_use_and_start_refuses(tmp_path):
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", cfg.blob_port))
-    srv.listen(1)
+    # Generous backlog: the health probes connect without anyone accepting, and
+    # macOS/Windows refuse connects once the tiny accept queue fills up.
+    srv.listen(50)
     try:
         mgr = azctl.ServiceManager(cfg, command_for=listener_command, health_timeout=0.1)
         mgr.refresh()

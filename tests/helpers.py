@@ -12,7 +12,7 @@ LISTENER_SCRIPT = (
     "s = socket.socket()\n"
     "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
     "s.bind(('127.0.0.1', int(sys.argv[1])))\n"
-    "s.listen(5)\n"
+    "s.listen(50)\n"
     "time.sleep(120)\n"
 )
 SLEEPER_SCRIPT = "import time; time.sleep(120)"
