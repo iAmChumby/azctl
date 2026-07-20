@@ -10,3 +10,4 @@ __queuestorage__/
 __tablestorage__/
 .venv/
 venv/
+.claude/

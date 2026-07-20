@@ -9,11 +9,12 @@ import azctl  # noqa: E402
 
 
 def test_snapshot_reports_all_three_services():
-    snap = azctl.snapshot()
-    assert set(snap) == {"blob", "queue", "table"}
-    assert snap["blob"]["port"] == 10000
-    assert snap["queue"]["port"] == 10001
-    assert snap["table"]["port"] == 10002
+    snap = azctl.observe(azctl.Config())
+    services = snap["services"]
+    assert set(services) == {"blob", "queue", "table"}
+    assert services["blob"]["port"] == 10000
+    assert services["queue"]["port"] == 10001
+    assert services["table"]["port"] == 10002
 
 
 def test_port_open_detects_listener():
@@ -32,4 +33,4 @@ def test_status_json_is_machine_readable(capsys):
     rc = azctl.main(["status", "--json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert set(out) == {"blob", "queue", "table"}
+    assert set(out["services"]) == {"blob", "queue", "table"}
