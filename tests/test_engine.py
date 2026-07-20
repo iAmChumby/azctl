@@ -26,6 +26,7 @@ from helpers import (
     listener_command,
     make_config,
     spawn_listener,
+    wait_dispatch,
     wait_for,
 )
 
@@ -545,6 +546,10 @@ def test_killing_our_own_child_reads_stopped_not_broken(tmp_path):
         assert "PID %d" % pid in dash.ui.pending_prompt
         assert str(cfg.blob_port) in dash.ui.pending_prompt
         dash.handle_event(azctl.KeyEvent("enter"))  # confirm the kill
+        # The kill involves a real psutil call against a real child process,
+        # which can exceed Dashboard's synchronous dispatch grace window on
+        # a slow/loaded runner — drain it the way run()'s loop would.
+        assert wait_dispatch(dash)
         assert dash.ui.message is not None and "Killed" in dash.ui.message[0]
         assert wait_for(lambda: refreshed_state(mgr, "blob") == azctl.STOPPED)
         assert view_of(mgr, "blob").state != azctl.BROKEN

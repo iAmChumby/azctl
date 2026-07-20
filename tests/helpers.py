@@ -62,3 +62,24 @@ def wait_for(predicate, timeout=10.0, interval=0.05):
             return True
         time.sleep(interval)
     return False
+
+
+def wait_dispatch(dash, timeout=10.0, interval=0.02):
+    """Drain a Dashboard._dispatch()'ed confirm action to completion.
+
+    Dashboard._dispatch() gives a confirmed action a short grace window to
+    finish synchronously (so fast/fake actions behave exactly as before);
+    slower ones (real kill_pid() waits, a loaded/slow CI runner) fall
+    through to the async path and need something to call _poll_pending()
+    the way Dashboard.run()'s render loop would. Tests that drive
+    handle_event() directly without running that loop use this instead of
+    asserting on dash.ui.message immediately, so they aren't racing the
+    worker thread's precise timing.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dash._poll_pending()
+        if not dash._busy:
+            return True
+        time.sleep(interval)
+    return False

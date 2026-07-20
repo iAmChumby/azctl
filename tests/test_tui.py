@@ -21,7 +21,7 @@ import pytest
 from rich.console import Console
 
 import azctl
-from helpers import free_port, spawn_listener, wait_for
+from helpers import free_port, spawn_listener, wait_dispatch, wait_for
 
 
 # --- render helpers -----------------------------------------------------
@@ -449,6 +449,10 @@ def test_free_port_confirm_enter_kills_and_reports_green():
         dash._activate(4)
         assert dash.ui.mode == "confirm"
         dash.handle_event(key("enter"))
+        # A real psutil kill against a real child process can exceed the
+        # synchronous dispatch grace window on a slow/loaded runner — drain
+        # it the way run()'s render loop would.
+        assert wait_dispatch(dash)
         assert dash.ui.message[1] == "green"
         assert "free" in dash.ui.message[0]
         assert str(squatter.pid) in dash.ui.message[0]
