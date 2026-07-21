@@ -15,12 +15,14 @@ toggles, connection-string copy, the help overlay, the three-way quit
 question, the broken-transition bell, and the non-TTY refusal.
 """
 
+import asyncio
 import base64
 import io
 import os
 import re
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -810,3 +812,334 @@ async def test_refresh_timer_does_not_race_app_teardown():
             await pilot.pause()
             await pilot.press("escape")
             await pilot.pause()
+
+
+# --- review-fix regressions ------------------------------------------------
+# Each test below is a regression for one CONFIRMED finding from the review
+# of the Textual port.
+
+
+# Finding: DataTable only posts RowSelected when the click lands on the row
+# the cursor is ALREADY on -- the first click on a *different* row only moves
+# the cursor and posts RowHighlighted instead, which AzctlApp used to ignore
+# entirely. A single click on a row other than the current selection must
+# update ui.selected immediately (no second click, no waiting on a timer).
+async def test_mouse_click_on_a_different_row_selects_it_in_one_click():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        table = app.query_one("#table")
+        assert app.ui.selected == 0
+        await pilot.click("#table", offset=(2, table.header_height + 2))  # row 2 = Table
+        await pilot.pause()
+        assert app.ui.selected == 2
+        assert app.ui.message[0] == "Selected Table."
+
+
+# Same finding as above: the periodic _populate_table() refresh (clear() then
+# move_cursor back to ui.selected) posts its own RowHighlighted echoes every
+# ~0.3s. Those must never be mistaken for a real click and silently snap the
+# selection back -- drive several refresh ticks after a click and make sure
+# the click sticks.
+async def test_selection_survives_repeated_refresh_ticks_after_a_click():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        table = app.query_one("#table")
+        await pilot.click("#table", offset=(2, table.header_height + 2))
+        await pilot.pause()
+        assert app.ui.selected == 2
+        await pilot.pause(0.9)  # several 0.1s ticks, well past the 3rd-tick refresh gate
+        assert app.ui.selected == 2
+        assert table.cursor_row == 2
+
+
+# Finding: ConfirmScreen/QuitScreen rendered as an unstyled strip pinned to
+# the TOP of the screen -- ModalScreen's own CSS only dims the background, it
+# does not position content -- contradicting BEHAVIOR.md's "The question
+# appears in the footer." The modal body must dock to the bottom, landing at
+# the same y as the real #footer, not y=0.
+async def test_confirm_and_quit_modals_dock_in_the_footer_region():
+    manager = FakeManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        footer_y = app.query_one("#footer").region.y
+        assert footer_y > 0
+
+        await pilot.press("right")  # Stop
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, azctl.ConfirmScreen)
+        body = app.screen.query_one(azctl._ModalBody)
+        assert body.styles.dock == "bottom"
+        assert body.region.y == footer_y
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press("q")
+        await pilot.pause()
+        assert isinstance(app.screen, azctl.QuitScreen)
+        body = app.screen.query_one(azctl._ModalBody)
+        assert body.styles.dock == "bottom"
+        assert body.region.y == footer_y
+
+
+# Finding: Ctrl+Q was never bound, so Textual's own built-in
+# Binding("ctrl+q", "quit", priority=True) fired instead and exited with
+# zero confirmation. Ctrl+C hard-coded an unconditional shutdown with no
+# confirmation either. Both are now aliases for 'q': they must raise the same
+# three-way stop/detach/stay question rather than silently tearing down (or
+# leaking) every owned service.
+async def test_ctrl_c_and_ctrl_q_both_trigger_the_three_way_quit_confirmation():
+    for key in ("ctrl+c", "ctrl+q"):
+        manager = FakeManager(owned={"blob"})
+        app = azctl.AzctlApp(azctl.Config(), manager)
+        async with dashboard(app) as pilot:
+            await pilot.pause()
+            await pilot.press(key)
+            await pilot.pause()
+            assert isinstance(app.screen, azctl.QuitScreen), key
+            assert app.is_running is True, key
+            assert manager.calls == [], key
+            await pilot.press("enter")  # confirm: stop + exit
+            await pilot.pause()
+            for _ in range(100):
+                await pilot.pause()
+                if not app.is_running:
+                    break
+                await asyncio.sleep(0.02)
+            assert ("shutdown",) in manager.calls, key
+            assert app.exit_note == "Stopped all services.", key
+
+
+async def test_ctrl_c_and_ctrl_q_with_nothing_owned_quit_quietly():
+    for key in ("ctrl+c", "ctrl+q"):
+        app = azctl.AzctlApp(azctl.Config(), FakeManager())
+        async with dashboard(app) as pilot:
+            await pilot.pause()
+            await pilot.press(key)
+            await pilot.pause()
+            assert app.is_running is False, key
+            assert app.exit_note is None, key
+
+
+# Finding: the '?' help overlay claimed to list every bound key but never
+# mentioned Ctrl+C or Ctrl+Q, even though Ctrl+C was live (and unconditionally
+# destructive before this fix) the whole time.
+async def test_help_overlay_mentions_ctrl_c_and_ctrl_q():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        out = export(app.screen.query_one(azctl._ModalBody).content, width=140)
+        assert "Ctrl+C" in out
+        assert "Ctrl+Q" in out
+
+
+# Finding: manager.shutdown() (kill_pid + proc.wait, up to ~3s per stuck
+# service) ran directly on the app's asyncio thread on every exit path,
+# freezing the whole UI -- rendering, input, timers -- for the duration.
+# Drive a real quit through a (fake, but deliberately slow) shutdown and
+# assert a parallel high-frequency heartbeat keeps advancing throughout, i.e.
+# the event loop was never blocked.
+async def test_quit_keeps_the_event_loop_responsive_while_shutdown_is_slow():
+    class SlowShutdownManager(FakeManager):
+        def shutdown(self):
+            time.sleep(0.5)  # simulates a stubborn child ignoring SIGTERM
+            FakeManager.shutdown(self)
+
+    manager = SlowShutdownManager(owned={"blob", "queue", "table"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            t0 = time.monotonic()
+            await pilot.press("q")
+            await pilot.pause()
+            assert isinstance(app.screen, azctl.QuitScreen)
+            await pilot.press("enter")
+            for _ in range(200):
+                await pilot.pause()
+                if not app.is_running:
+                    break
+                await asyncio.sleep(0.02)
+            elapsed = time.monotonic() - t0
+        finally:
+            hb.cancel()
+        assert app.is_running is False
+        assert ("shutdown",) in manager.calls
+        assert elapsed >= 0.45, "the fake shutdown should have taken its full ~0.5s"
+        # A blocked event loop could only have advanced the heartbeat a
+        # handful of times regardless of wall-clock elapsed time; a live one
+        # advances roughly once per 20ms throughout.
+        assert len(ticks) >= (elapsed / 0.02) * 0.4, (len(ticks), elapsed)
+
+
+# Finding: ServiceManager.refresh() does real socket.create_connection()
+# calls for every configured port, synchronously on the main thread, every
+# ~0.3s -- against a slow-to-refuse host this stalls the whole UI. Drive a
+# (fake, but deliberately slow) refresh() through the normal tick path and
+# assert the event loop stays responsive while it's in flight.
+async def test_periodic_refresh_runs_off_the_event_loop():
+    class SlowRefreshManager(FakeManager):
+        def refresh(self):
+            time.sleep(0.3)
+            return []
+
+    manager = SlowRefreshManager()
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            t0 = time.monotonic()
+            await pilot.pause(0.9)
+            elapsed = time.monotonic() - t0
+        finally:
+            hb.cancel()
+        assert len(ticks) >= (elapsed / 0.02) * 0.4, (len(ticks), elapsed)
+
+
+# Finding: the signal.signal()-registered handler called
+# self.call_from_thread(self._shutdown_from_signal) -- but a real OS signal
+# handler always runs on the SAME thread that owns the asyncio loop, and
+# Textual's call_from_thread unconditionally raises RuntimeError in that
+# case, so no external SIGINT/SIGTERM/SIGHUP ever actually reached
+# _do_shutdown(). _install_os_signal_handlers now uses
+# loop.add_signal_handler, whose callback runs as an ordinary loop callback
+# (no thread hop) -- calling _shutdown_from_signal directly here reproduces
+# that exact calling convention and must not raise.
+async def test_shutdown_from_signal_does_not_raise_and_shuts_down_cleanly():
+    manager = FakeManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        app._shutdown_from_signal()  # must not raise
+        for _ in range(100):
+            await pilot.pause()
+            if not app.is_running:
+                break
+            await asyncio.sleep(0.02)
+        assert ("shutdown",) in manager.calls
+        assert app.exit_note == "Interrupted — stopped all services."
+
+
+# Finding: a second signal arriving while the first shutdown's
+# manager.shutdown() was still blocking used to raise a SECOND RuntimeError
+# that aborted ServiceManager.shutdown()'s loop before every service got
+# stopped, orphaning whichever hadn't been reached yet. The _shutdown_done
+# guard must make a second call a harmless no-op instead.
+async def test_second_signal_during_shutdown_is_a_harmless_no_op():
+    manager = FakeManager(owned={"blob", "queue", "table"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        app._shutdown_from_signal()
+        app._shutdown_from_signal()  # simulates a second SIGTERM mid-shutdown
+        for _ in range(100):
+            await pilot.pause()
+            if not app.is_running:
+                break
+            await asyncio.sleep(0.02)
+        assert manager.calls.count(("shutdown",)) == 1
+
+
+async def _wait_until(predicate, pilot, attempts=30):
+    """Drain the Pilot's message queue with zero-delay pause()s (NOT
+    asyncio.sleep -- these cost negligible real wall-clock time) until
+    `predicate()` is true. Used to observe the resize-redraw chain (App ->
+    Screen -> our _redraw_after_resize, each a separate hop through
+    call_after_refresh) settle without ever advancing far enough in real
+    time for AzctlApp's own 0.1s periodic tick to fire and mask the result --
+    i.e. this proves the *resize hook* redrew, not the ambient tick."""
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await pilot.pause()
+    return False
+
+
+# Finding: only the periodic ~0.1s tick re-rendered the log/table/header
+# panels, so a resized terminal briefly showed content computed for the OLD
+# size -- render_logs() slicing far more (or fewer) lines than the new area
+# can actually show, until the next tick caught up. Resizing must trigger its
+# own redraw well before the next tick, not rely on it.
+async def test_resize_redraws_the_log_panel_at_the_new_size_before_the_next_tick():
+    manager = FakeManager()
+    for i in range(40):
+        manager.logs.append("blob", "line %d" % i)
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.resize_terminal(100, 40)
+        assert await _wait_until(lambda: len(logpanel_text(app).splitlines()) > 10, pilot)
+        tall_lines = len(logpanel_text(app).splitlines())
+
+        await pilot.resize_terminal(100, 10)
+        assert await _wait_until(lambda: len(logpanel_text(app).splitlines()) < tall_lines, pilot)
+        short_lines = len(logpanel_text(app).splitlines())
+        assert short_lines < tall_lines
+
+
+# Finding: an unrelated ->broken transition's bell + red message used to fire
+# underneath an open ConfirmScreen/QuitScreen/HelpScreen/ConnScreen (they only
+# dim the base screen, they don't hide it), competing with the isolated
+# decision the user is supposed to be focused on. It must be buffered while a
+# modal is open and only surface once that modal is dismissed.
+async def test_modal_suppresses_bell_and_message_then_flushes_on_dismiss():
+    class DelayedBrokenManager(FakeManager):
+        def __init__(self, owned=()):
+            FakeManager.__init__(self, owned=owned)
+            self.armed = False
+
+        def refresh(self):
+            if self.armed:
+                self.armed = False
+                return [azctl.Transition("queue", azctl.STARTING, azctl.BROKEN)]
+            return []
+
+        def broken_reason(self, _name):
+            return "queue died"
+
+    manager = DelayedBrokenManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    bells = []
+    app.bell = lambda: bells.append(True)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        # HelpScreen: a read-only overlay, so nothing else competes for the
+        # message line after it's dismissed -- proves the flushed alert
+        # actually surfaces, not just that the bell rings.
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, azctl.HelpScreen)
+        manager.armed = True
+        await pilot.pause(0.5)  # let the tick-gate fire the ->broken transition
+        assert bells == [], "bell must not fire while a modal is open"
+        assert app.ui.message is None or app.ui.message[1] != "red"
+        assert app._pending_bell is True
+        assert app._buffered_alert_message == ("queue died", "red")
+
+        await pilot.press("x")  # any key closes the help overlay
+        await pilot.pause()
+        assert not isinstance(app.screen, azctl.HelpScreen)
+        assert bells == [True], "bell must fire once the modal is dismissed"
+        assert app.ui.message[0] == "queue died"
+        assert app.ui.message[1] == "red"

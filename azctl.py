@@ -13,6 +13,7 @@ from __future__ import annotations
 
 # --- stdlib imports only ------------------------------------------------ §0
 import argparse
+import asyncio
 import base64
 import collections
 import itertools
@@ -1150,6 +1151,7 @@ HELP_ROWS = (
     ("?", "This help overlay"),
     ("Esc", "Cancel a confirmation / close an overlay"),
     ("q", "Quit — asks what to do with services that are still running"),
+    ("Ctrl+C / Ctrl+Q", "Same as q — asks what to do with services that are still running"),
     ("mouse", "Click a table row to select it"),
     ("", ""),
     ("Start", "Start the selected service"),
@@ -1241,7 +1243,18 @@ if _HAVE_DEPS:
 
 
     class ConfirmScreen(ModalScreen):
-        """dismiss(True) on Enter; dismiss(False) on literally anything else."""
+        """dismiss(True) on Enter; dismiss(False) on literally anything else.
+
+        BEHAVIOR.md: "The question appears in the footer." ModalScreen's own
+        DEFAULT_CSS only dims the background -- it does not position content
+        -- so without this the body would render as an unstyled strip pinned
+        to the top of the screen. Docking it to the bottom, at the footer's
+        own height, puts the prompt where the contract says it belongs.
+        """
+
+        DEFAULT_CSS = """
+        ConfirmScreen #modal_body { dock: bottom; height: 4; width: 100%; }
+        """
 
         def __init__(self, prompt: str) -> None:
             super().__init__()
@@ -1254,7 +1267,8 @@ if _HAVE_DEPS:
                     style="bold yellow",
                     no_wrap=True,
                     overflow="ellipsis",
-                )
+                ),
+                id="modal_body",
             )
 
         def on_key(self, event) -> None:
@@ -1265,7 +1279,14 @@ if _HAVE_DEPS:
     class QuitScreen(ModalScreen):
         """dismiss('stop'|'detach') on Enter/n; dismiss('stay') on Esc; every OTHER
         key is swallowed and the screen stays open — this is NOT the same rule as
-        ConfirmScreen (three answers only, BEHAVIOR.md)."""
+        ConfirmScreen (three answers only, BEHAVIOR.md).
+
+        Same footer-docking rationale as ConfirmScreen above.
+        """
+
+        DEFAULT_CSS = """
+        QuitScreen #modal_body { dock: bottom; height: 4; width: 100%; }
+        """
 
         def compose(self) -> ComposeResult:
             yield _ModalBody(
@@ -1275,7 +1296,8 @@ if _HAVE_DEPS:
                     style="bold yellow",
                     no_wrap=True,
                     overflow="ellipsis",
-                )
+                ),
+                id="modal_body",
             )
 
         def on_key(self, event) -> None:
@@ -1316,6 +1338,13 @@ if _HAVE_DEPS:
             Binding("question_mark", "show_help", show=False),
             Binding("q", "quit_app", show=False),
             Binding("ctrl+c", "interrupt", show=False),
+            # Textual's base App class ships a built-in, always-live
+            # Binding("ctrl+q", "quit", priority=True) that otherwise shadows
+            # this one and exits with zero confirmation, bypassing the
+            # three-way stop/detach/stay question entirely (a stray-keystroke
+            # regression BEHAVIOR.md's confirmation contract is meant to
+            # prevent). priority=True is required so *this* binding wins.
+            Binding("ctrl+q", "quit_app", show=False, priority=True),
         ]
 
         def __init__(
@@ -1337,6 +1366,12 @@ if _HAVE_DEPS:
             self._busy = False
             self._shutdown_done = False
             self._tick_count = 0
+            self._refresh_in_flight = False
+            self._old_signal_handlers = []
+            self._pending_bell = False
+            self._buffered_alert_message = None
+            self._mounted = False
+            self._expected_row_highlights = collections.deque()
 
         # -- composition & mount ----------------------------------------------
         def compose(self) -> ComposeResult:
@@ -1364,6 +1399,7 @@ if _HAVE_DEPS:
             if self.start_all_on_entry:
                 msg, style = self._aggregate(self.manager.start_all())
                 self.show(msg, style)
+            self._mounted = True
             self._refresh_widgets()
 
         def _probe_versions(self) -> None:
@@ -1396,6 +1432,19 @@ if _HAVE_DEPS:
         # -- refresh tick ---------------------------------------------------------
         def _populate_table(self, views) -> None:
             table = self.query_one("#table", DataTable)
+            # clear() forces the cursor back to row 0, and the move_cursor()
+            # below restores it to ui.selected -- both are genuine cursor
+            # *moves* whenever the row actually changes, and DataTable posts
+            # a real RowHighlighted for each one (see the comment on
+            # _select_row below). Every ~0.3s refresh tick would otherwise
+            # emit a false "the user highlighted row 0" event that
+            # on_data_table_row_highlighted can't tell apart from a genuine
+            # click -- _expect_cursor_move() pre-registers exactly the moves
+            # WE are about to cause (only when they'll actually fire, mirroring
+            # DataTable's own old-coordinate != new-coordinate check) so that
+            # handler can filter them out and only react to real ones.
+            if table.cursor_coordinate.row != 0:
+                self._expect_cursor_move(0)
             table.clear()
             for view in views:
                 table.add_row(
@@ -1405,6 +1454,8 @@ if _HAVE_DEPS:
                     str(view.pid) if view.pid is not None else "—",
                     format_uptime(view.uptime) if view.uptime is not None else "—",
                 )
+            if table.cursor_coordinate.row != self.ui.selected:
+                self._expect_cursor_move(self.ui.selected)
             table.move_cursor(row=self.ui.selected)  # clear() resets cursor to 0
 
         def _on_tick(self) -> None:
@@ -1418,20 +1469,107 @@ if _HAVE_DEPS:
             if not self.is_running:
                 return
             if self._tick_count % 3 == 0:  # ~3.3 Hz, matching the old tick%3==0 gate
-                transitions = self.manager.refresh()
-                broken = [t for t in transitions if t.new == BROKEN]
-                if broken:
-                    self.bell()
-                    for t in broken:
-                        reason = self.manager.broken_reason(t.service)
-                        if reason:
-                            self.show(reason, "red")
+                # manager.refresh() does real socket.create_connection() calls
+                # for each configured port (port_open, up to health_timeout
+                # each) -- against a non-default/unreachable --host this can
+                # genuinely block for a noticeable fraction of a second, which
+                # on the main thread would stall every redraw and keystroke.
+                # Run it on a worker thread instead, same pattern as the
+                # confirmed button actions. Skip starting a new one while
+                # either a previous refresh or a confirmed action is still in
+                # flight, since ServiceManager's per-service state isn't
+                # guarded against being mutated from two threads at once.
+                if not self._refresh_in_flight and not self._busy:
+                    self._refresh_in_flight = True
+                    self._refresh_worker()
             self._tick_count += 1
             try:
                 self._refresh_widgets()
             except NoMatches:
                 # Belt-and-braces for the same race: the widgets vanished
                 # between the is_running check above and this call.
+                pass
+
+        @work(thread=True)
+        def _refresh_worker(self) -> None:
+            try:
+                transitions = self.manager.refresh()
+            except Exception:  # noqa: BLE001 - never let a worker crash the app
+                transitions = []
+            self.call_from_thread(self._finish_refresh, transitions)
+
+        def _finish_refresh(self, transitions) -> None:
+            self._refresh_in_flight = False
+            broken = [t for t in transitions if t.new == BROKEN]
+            if not broken:
+                return
+            # A ConfirmScreen/QuitScreen/HelpScreen/ConnScreen sitting on top
+            # is meant to be an isolated, unambiguous decision point --
+            # BEHAVIOR.md never says an unrelated alert should compete with
+            # it. ModalScreen only dims the base screen (translucent, not an
+            # opaque cover), so without this gate the bell and message would
+            # still visibly/audibly fire underneath an open modal. Buffer
+            # instead and flush once the modal in front is dismissed.
+            if len(self.screen_stack) > 1:
+                self._pending_bell = True
+                for t in broken:
+                    reason = self.manager.broken_reason(t.service)
+                    if reason:
+                        self._buffered_alert_message = (reason, "red")
+                return
+            self.bell()
+            for t in broken:
+                reason = self.manager.broken_reason(t.service)
+                if reason:
+                    self.show(reason, "red")
+
+        def _flush_pending_alerts(self) -> None:
+            if self._pending_bell:
+                self._pending_bell = False
+                self.bell()
+            if self._buffered_alert_message is not None:
+                text, style = self._buffered_alert_message
+                self._buffered_alert_message = None
+                self.show(text, style)
+
+        def _check_resize(self) -> None:
+            # The log/table/header panels are otherwise only re-rendered by
+            # the periodic tick (~every 0.1s), which briefly leaves a resized
+            # terminal showing content computed for the OLD size -- oversized
+            # or stale for up to one tick. Redraw against the widgets' new
+            # sizes as soon as a resize has actually settled.
+            #
+            # NOT App.on_resize(): the public Resize event fires as soon as
+            # the new terminal size is known, but App._check_resize() (this
+            # method, which we're overriding) is what actually forwards that
+            # event to the Screen -- and only the SCREEN's own resize handler
+            # re-arranges child widgets against the new size. An on_resize
+            # hook (even via call_after_refresh(), which only waits on the
+            # App's own message queue) can and does run before that
+            # screen-level layout has settled, reading logpanel.size.height
+            # still holding the OLD value and defeating the whole point --
+            # confirmed flaky in exactly that way in testing. Overriding this
+            # (private, but stable across the pinned textual==8.2.8) hook
+            # instead means our redraw is scheduled only once Textual's own
+            # resize machinery has done the one thing that actually resizes
+            # widgets, with no fixed guess-timer needed.
+            #
+            # self.screen.call_after_refresh(), not self.call_after_refresh():
+            # _check_resize() posts the actual resize event onto the SCREEN's
+            # own message queue (a separate MessagePump from the App, with its
+            # own independently-scheduled processing), which is what re-
+            # arranges child widgets. Scheduling our callback on the App's
+            # queue instead only waits for the App's OWN pending messages --
+            # an independent race against the Screen's queue that was
+            # confirmed to flake (about 1 in 150 runs) under load.
+            super()._check_resize()
+            if self._mounted:  # can fire before on_mount()'s initial layout
+                self.screen.call_after_refresh(self._redraw_after_resize)
+
+        def _redraw_after_resize(self) -> None:
+            try:
+                self._refresh_widgets()
+            except NoMatches:
                 pass
 
         def _refresh_widgets(self) -> None:
@@ -1458,17 +1596,46 @@ if _HAVE_DEPS:
 
         # -- mouse: DataTable row click selects a service (free bonus, not in
         # BEHAVIOR.md's hard keyboard contract) -------------------------------
-        def on_data_table_row_selected(self, event) -> None:
-            row = getattr(event, "cursor_row", None)
+        #
+        # Textual's DataTable only posts RowSelected when the clicked
+        # coordinate already equals the *current* cursor coordinate -- the
+        # first click on a *different* row just moves the cursor and posts
+        # RowHighlighted instead. Listening to RowHighlighted too (guarded so
+        # it's a no-op when nothing actually changed) is what makes a single
+        # click on any row actually update ui.selected; without it, clicking a
+        # row other than the one already selected silently did nothing.
+        def _expect_cursor_move(self, row: int) -> None:
+            """Register a cursor move WE are about to make, so the next
+            matching RowHighlighted is recognised as our own echo rather than
+            a genuine mouse click (see _populate_table)."""
+            self._expected_row_highlights.append(row)
+
+        def _select_row(self, row) -> None:
             if row is None or not (0 <= row < len(SERVICE_ORDER)):
+                return
+            if self._expected_row_highlights and self._expected_row_highlights[0] == row:
+                # Our own periodic-refresh or keyboard-driven cursor move
+                # echoing back, not a click -- consume it and stay quiet.
+                self._expected_row_highlights.popleft()
+                return
+            if row == self.ui.selected:
                 return
             self.ui.selected = row
             self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
 
+        def on_data_table_row_highlighted(self, event) -> None:
+            self._select_row(getattr(event, "cursor_row", None))
+
+        def on_data_table_row_selected(self, event) -> None:
+            self._select_row(getattr(event, "cursor_row", None))
+
         # -- key actions ----------------------------------------------------------
         def _select(self, step: int) -> None:
             self.ui.selected = (self.ui.selected + step) % len(SERVICE_ORDER)
-            self.query_one("#table", DataTable).move_cursor(row=self.ui.selected)
+            table = self.query_one("#table", DataTable)
+            if table.cursor_coordinate.row != self.ui.selected:
+                self._expect_cursor_move(self.ui.selected)
+            table.move_cursor(row=self.ui.selected)
             self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
 
         def action_select_prev(self) -> None:
@@ -1501,14 +1668,14 @@ if _HAVE_DEPS:
                 "Copied %s connection string to clipboard (OSC 52)." % name.capitalize(),
                 "green",
             )
-            self.push_screen(ConnScreen(self.config, self.ui.selected))
+            self.push_screen(ConnScreen(self.config, self.ui.selected), lambda _r=None: self._flush_pending_alerts())
 
         def action_save_merged(self) -> None:
             _ok, msg, style = self.manager.save_merged_log()
             self.show(msg, style)
 
         def action_show_help(self) -> None:
-            self.push_screen(HelpScreen())
+            self.push_screen(HelpScreen(), lambda _r=None: self._flush_pending_alerts())
 
         def action_quit_app(self) -> None:
             if self._busy:
@@ -1519,10 +1686,18 @@ if _HAVE_DEPS:
                 self.exit()  # nothing running: quit quietly
 
         def action_interrupt(self) -> None:
+            # Ctrl+C is a fast alias for 'q', not an unconditional kill: it
+            # goes through the same three-way stop/detach/stay question so a
+            # stray/muscle-memory Ctrl+C can't silently tear down every owned
+            # service with zero confirmation (BEHAVIOR.md's confirmation
+            # contract -- "anything that stops or kills a process asks before
+            # doing it" -- applies here too).
+            if self._busy:
+                return
             if self.manager.any_owned():
-                self.exit_note = "Interrupted — stopped all services."
-            self._do_shutdown()
-            self.exit()
+                self.push_screen(QuitScreen(), self._on_quit_result)
+            else:
+                self.exit()
 
         # -- button actions ---------------------------------------------------
         def _activate(self, idx: int) -> None:
@@ -1611,6 +1786,7 @@ if _HAVE_DEPS:
             self.push_screen(ConfirmScreen(prompt), lambda ok: self._on_confirm(ok, action, prompt))
 
         def _on_confirm(self, ok: bool, action, prompt: str) -> None:
+            self._flush_pending_alerts()
             if not ok:
                 self.show("Cancelled.", "grey")
                 return
@@ -1631,10 +1807,11 @@ if _HAVE_DEPS:
             self.show(msg, style)
 
         def _on_quit_result(self, result: str) -> None:
+            self._flush_pending_alerts()
             if result == "stop":
                 self.exit_note = "Stopped all services."
-                self._do_shutdown()
-                self.exit()
+                self.show("Stopping services…", "grey")
+                self._do_shutdown()  # _finish_shutdown() calls self.exit() once done
             elif result == "detach":
                 self.manager.detach_all()
                 self.detached = True
@@ -1643,44 +1820,82 @@ if _HAVE_DEPS:
             # "stay": nothing to do, the screen already closed itself
 
         # -- shutdown, the single choke point every exit path funnels through --
-        def _do_shutdown(self) -> None:
-            if self._shutdown_done:
-                return
-            self._shutdown_done = True
-            old = []
+        #
+        # manager.shutdown() -> ServiceManager.stop() calls kill_pid(...) then
+        # proc.wait(timeout=3.0) for every owned service, one at a time -- both
+        # blocking. Running that directly on the app's asyncio thread would
+        # freeze the entire event loop (rendering, input, timers) for up to
+        # ~3s per stuck service. signal.signal() itself must stay on the main
+        # thread (Python raises if it's called off-thread), so _do_shutdown
+        # only masks signals here and hands the actual blocking work to a
+        # worker thread; _finish_shutdown restores the handlers and exits once
+        # that worker reports back via call_from_thread.
+        def _mask_shutdown_signals(self) -> None:
+            self._old_signal_handlers = []
             for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
                 signum = getattr(signal, signame, None)
                 if signum is None:
                     continue
                 try:
-                    old.append((signum, signal.signal(signum, signal.SIG_IGN)))
+                    self._old_signal_handlers.append((signum, signal.signal(signum, signal.SIG_IGN)))
                 except (ValueError, OSError):
                     pass
+
+        def _restore_shutdown_signals(self) -> None:
+            for signum, prev in self._old_signal_handlers:
+                try:
+                    signal.signal(signum, prev)
+                except (ValueError, OSError):
+                    pass
+            self._old_signal_handlers = []
+
+        def _do_shutdown(self) -> None:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
+            self._busy = True  # blocks other actions/re-entrant quit prompts until we're done
+            self._mask_shutdown_signals()
+            self._shutdown_worker()
+
+        @work(thread=True)
+        def _shutdown_worker(self) -> None:
             try:
                 self.manager.shutdown()
             finally:
-                for signum, prev in old:
-                    try:
-                        signal.signal(signum, prev)
-                    except (ValueError, OSError):
-                        pass
+                self.call_from_thread(self._finish_shutdown)
+
+        def _finish_shutdown(self) -> None:
+            self._restore_shutdown_signals()
+            self._busy = False
+            self.exit()
 
         def _install_os_signal_handlers(self) -> None:
-            def handler(_signum, _frame):
-                self.call_from_thread(self._shutdown_from_signal)
-
+            # NOT signal.signal(): a plain signal.signal()-registered handler
+            # always runs on the process's one main thread, which is also the
+            # thread running this app's asyncio loop -- so call_from_thread()
+            # from inside it would (and did) always raise "must run in a
+            # different thread from the app". loop.add_signal_handler runs its
+            # callback as an ordinary loop callback instead of inside a raw
+            # OS-signal stack frame, so no thread hop is needed at all: call
+            # _shutdown_from_signal directly. NotImplementedError (Windows) or
+            # RuntimeError (no running loop yet) just leaves that signal
+            # unhandled by us, same as before.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
             for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
                 signum = getattr(signal, signame, None)
-                if signum is not None:
-                    try:
-                        signal.signal(signum, handler)
-                    except (ValueError, OSError):
-                        pass
+                if signum is None:
+                    continue
+                try:
+                    loop.add_signal_handler(signum, self._shutdown_from_signal)
+                except (NotImplementedError, RuntimeError, ValueError, OSError):
+                    pass
 
         def _shutdown_from_signal(self) -> None:
             self.exit_note = "Interrupted — stopped all services."
             self._do_shutdown()
-            self.exit()
 
 
 def run_dashboard(config: Config, start_all_on_entry: bool = False) -> int:
