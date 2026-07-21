@@ -358,18 +358,20 @@ class TestMissingRuntime:
         assert manager.refresh() == []
         assert manager.views()[0].state == azctl.STOPPED
 
-    def test_dashboard_start_button_shows_the_install_hint(self, monkeypatch, tmp_path):
+    async def test_dashboard_start_button_shows_the_install_hint(self, monkeypatch, tmp_path):
         """Item 71, through the TUI seam: the Start button surfaces the same
         red message on the dashboard's message line (no event loop needed)."""
         monkeypatch.setenv("PATH", "")
         config = make_config(azctl, tmp_path)
         manager = azctl.ServiceManager(config)
-        dash = azctl.Dashboard(config, manager, clock=lambda: 100.0, sleep=lambda _s: None)
-        dash._activate(0)  # the Start button (BUTTONS[0])
-        text, style, _expires = dash.ui.message
-        assert "npm install -g azurite" in text
-        assert style == "red"
-        assert dash.running  # the dashboard did not fall over
+        app = azctl.AzctlApp(config, manager, clock=lambda: 100.0)
+        async with app.run_test() as pilot:
+            app._activate(0)  # the Start button (BUTTONS[0])
+            await pilot.pause()
+            text, style, _expires = app.ui.message
+            assert "npm install -g azurite" in text
+            assert style == "red"
+            assert app.is_running  # the dashboard did not fall over
 
     def test_missing_node_runtime_is_red_message_no_traceback(self, tmp_path):
         """Item 72: a missing Node runtime is a clear red message too."""

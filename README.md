@@ -1,6 +1,6 @@
 # azctl
 
-**A single-file terminal dashboard for the [Azurite](https://github.com/Azure/Azurite) Azure Storage emulator.**
+**A single-file Textual TUI for the [Azurite](https://github.com/Azure/Azurite) Azure Storage emulator.**
 
 Azurite is really three services running side by side — Blob, Queue, and Table — and out of the box there is no single place to see whether they are up, down, or broken. `azctl` is that place: a full-screen terminal dashboard that shows the health of all three services at once, lets you start and stop them, streams their logs live, and names the process squatting on a port when something else has claimed it.
 
@@ -19,7 +19,7 @@ Azurite is really three services running side by side — Blob, Queue, and Table
 
 ## Zero-install run
 
-One file, no setup. It bootstraps its own dependencies on first run (into an isolated venv — your system Python is never touched):
+One file, no setup. It bootstraps Textual and psutil on first run (into an isolated venv — your system Python is never touched):
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/iAmChumby/azctl/main/azctl.py
@@ -73,7 +73,7 @@ Nothing in this tool can touch stored data. It manages *whether the services run
 - **`c` connection strings** — shows the Azurite connection string per service and copies it to your clipboard (OSC 52, works over SSH).
 - **`status --json`** — machine-readable snapshot for scripts and CI.
 - **Config file + flags** — custom ports, host, data directory via `~/.config/azctl/config.json` or `--blob-port`-style flags.
-- **Mouse support** — click a row to select it, click a button to run it.
+- **Mouse support** — click a row to select it.
 - **Terminal bell on failure** — an audible cue the moment a service flips to broken, so you notice even when the window isn't focused.
 - **Save all** — one keystroke (`S`) writes the merged log of all three services, each line tagged with its service name and timestamp, to a single plain-text file (`azurite-all.log`).
 - **Version line** — the header shows the Azurite and Node versions actually in use, so "works on my machine" arguments end faster.
@@ -83,6 +83,7 @@ Nothing in this tool can touch stored data. It manages *whether the services run
 
 - Python 3.9+ (any OS — Linux, macOS, Windows)
 - Node.js + `npm install -g azurite` (azctl will tell you if it's missing)
+- Textual and psutil are bootstrapped automatically on first run if not present
 
 ## Behavior spec
 

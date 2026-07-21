@@ -1,5 +1,6 @@
 """Shared test helpers: ephemeral ports, fake service scripts, polling."""
 
+import asyncio
 import socket
 import subprocess
 import sys
@@ -64,22 +65,20 @@ def wait_for(predicate, timeout=10.0, interval=0.05):
     return False
 
 
-def wait_dispatch(dash, timeout=10.0, interval=0.02):
-    """Drain a Dashboard._dispatch()'ed confirm action to completion.
+async def wait_busy_clears(pilot, app, timeout=10.0, interval=0.02):
+    """Drain an AzctlApp._run_confirmed() threaded worker to completion.
 
-    Dashboard._dispatch() gives a confirmed action a short grace window to
-    finish synchronously (so fast/fake actions behave exactly as before);
-    slower ones (real kill_pid() waits, a loaded/slow CI runner) fall
-    through to the async path and need something to call _poll_pending()
-    the way Dashboard.run()'s render loop would. Tests that drive
-    handle_event() directly without running that loop use this instead of
-    asserting on dash.ui.message immediately, so they aren't racing the
-    worker thread's precise timing.
+    Confirmed actions (Stop, Restart, Free port, Stop all) always run on a
+    background thread (@work(thread=True)) and report back via
+    call_from_thread — there is no synchronous "grace window" anymore, so
+    tests that press Enter to confirm must pump the Pilot's event loop
+    (pilot.pause()) until AzctlApp._busy clears, rather than asserting on
+    app.ui.message immediately.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        dash._poll_pending()
-        if not dash._busy:
+        await pilot.pause()
+        if not app._busy:
             return True
-        time.sleep(interval)
+        await asyncio.sleep(interval)
     return False

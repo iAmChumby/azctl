@@ -26,7 +26,7 @@ from helpers import (
     listener_command,
     make_config,
     spawn_listener,
-    wait_dispatch,
+    wait_busy_clears,
     wait_for,
 )
 
@@ -529,28 +529,31 @@ def test_free_port_flow_reports_a_process_that_would_not_die(monkeypatch):
         srv.close()
 
 
-def test_killing_our_own_child_reads_stopped_not_broken(tmp_path):
+async def test_killing_our_own_child_reads_stopped_not_broken(tmp_path):
     """Free port aimed at the dashboard's own service: the engine is told via
     notice_external_kill and the row flips to stopped."""
     cfg = make_config(azctl, tmp_path)
     mgr = azctl.ServiceManager(cfg, command_for=listener_command, health_timeout=0.1)
-    dash = azctl.Dashboard(cfg, mgr, sleep=no_sleep)
+    app = azctl.AzctlApp(cfg, mgr)
     mgr.start("blob")
     try:
         assert wait_for(lambda: refreshed_state(mgr, "blob") == azctl.RUNNING)
         pid = view_of(mgr, "blob").pid
-        for _ in range(4):  # Start, Stop, Restart, Save -> Free port
-            dash.handle_event(azctl.KeyEvent("right"))
-        dash.handle_event(azctl.KeyEvent("enter"))
-        assert dash.ui.mode == "confirm"
-        assert "PID %d" % pid in dash.ui.pending_prompt
-        assert str(cfg.blob_port) in dash.ui.pending_prompt
-        dash.handle_event(azctl.KeyEvent("enter"))  # confirm the kill
-        # The kill involves a real psutil call against a real child process,
-        # which can exceed Dashboard's synchronous dispatch grace window on
-        # a slow/loaded runner — drain it the way run()'s loop would.
-        assert wait_dispatch(dash)
-        assert dash.ui.message is not None and "Killed" in dash.ui.message[0]
+        async with app.run_test() as pilot:
+            for _ in range(4):  # Start, Stop, Restart, Save -> Free port
+                await pilot.press("right")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, azctl.ConfirmScreen)
+            assert "PID %d" % pid in app.screen.prompt
+            assert str(cfg.blob_port) in app.screen.prompt
+            await pilot.press("enter")  # confirm the kill
+            # The kill involves a real psutil call against a real child
+            # process (plus free_port_flow's 1.5s settle wait), which runs
+            # on AzctlApp's threaded worker — drain it the way the app's
+            # own event loop would.
+            assert await wait_busy_clears(pilot, app)
+            assert app.ui.message is not None and "Killed" in app.ui.message[0]
         assert wait_for(lambda: refreshed_state(mgr, "blob") == azctl.STOPPED)
         assert view_of(mgr, "blob").state != azctl.BROKEN
     finally:
