@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test deps
-        run: pip install pytest rich psutil
+        run: pip install pytest pytest-asyncio textual psutil rich
       - name: Run tests
         run: pytest -q
 
