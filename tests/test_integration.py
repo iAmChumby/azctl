@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 
+import psutil
 import pytest
 from rich.console import Console
 from textual.coordinate import Coordinate
@@ -219,8 +220,6 @@ async def test_real_azurite_dashboard_full_lifecycle(tmp_path):
         "orphaned azurite process(es) after quit: %r"
         % (set(_azurite_node_pids()) - baseline_orphans,)
     )
-    import psutil
-
     for pid in started_pids:
         assert not psutil.pid_exists(pid), "PID %d (one of our own children) is still alive" % pid
     assert not azctl.port_open(config.host, config.blob_port)
