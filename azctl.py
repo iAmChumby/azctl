@@ -263,6 +263,7 @@ try:
     from textual import work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.css.query import NoMatches
     from textual.screen import ModalScreen
     from textual.widgets import DataTable, Static
 
@@ -271,7 +272,7 @@ except ImportError:
     psutil = None
     Console = Group = Live = Panel = Table = Text = None
     work = App = ComposeResult = Binding = ModalScreen = None
-    DataTable = Static = None
+    DataTable = Static = NoMatches = None
     _HAVE_DEPS = False
 
 
@@ -1367,7 +1368,14 @@ if _HAVE_DEPS:
 
         def _probe_versions(self) -> None:
             versions = detect_versions()
-            self.call_from_thread(self._set_versions, versions)
+            try:
+                self.call_from_thread(self._set_versions, versions)
+            except Exception:  # noqa: BLE001 - app may already be shutting down
+                # A background daemon thread racing app exit (the version probe
+                # can still be in flight when the user quits within the first
+                # tick): call_from_thread onto a closed event loop must never
+                # surface as an unhandled exception in this thread.
+                pass
 
         def _set_versions(self, versions) -> None:
             self.ui.versions = versions
@@ -1400,6 +1408,15 @@ if _HAVE_DEPS:
             table.move_cursor(row=self.ui.selected)  # clear() resets cursor to 0
 
         def _on_tick(self) -> None:
+            # set_interval's callback can still be queued for one more beat
+            # while the app is unwinding (Textual clears self._running before
+            # awaiting the rest of its own _shutdown()), which would otherwise
+            # reach _refresh_widgets() and query a widget that's already been
+            # unmounted. Ignoring the tick once we're no longer running keeps
+            # this a plain no-op instead of an unhandled NoMatches escaping
+            # out of the app's message pump.
+            if not self.is_running:
+                return
             if self._tick_count % 3 == 0:  # ~3.3 Hz, matching the old tick%3==0 gate
                 transitions = self.manager.refresh()
                 broken = [t for t in transitions if t.new == BROKEN]
@@ -1410,7 +1427,12 @@ if _HAVE_DEPS:
                         if reason:
                             self.show(reason, "red")
             self._tick_count += 1
-            self._refresh_widgets()
+            try:
+                self._refresh_widgets()
+            except NoMatches:
+                # Belt-and-braces for the same race: the widgets vanished
+                # between the is_running check above and this call.
+                pass
 
         def _refresh_widgets(self) -> None:
             self.query_one("#header", Static).update(render_header(self.config, self.ui.versions))
