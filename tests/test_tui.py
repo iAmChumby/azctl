@@ -16,6 +16,7 @@ question, the broken-transition bell, and the non-TTY refusal.
 """
 
 import base64
+import io
 import os
 import re
 import subprocess
@@ -56,7 +57,17 @@ async def dashboard(app):
 
 
 def export(renderable, width=140):
-    console = Console(record=True, width=width)
+    # file=io.StringIO(): a record=True Console still physically writes to
+    # its `file` in addition to recording. Without an explicit in-memory
+    # sink it defaults to sys.stdout -- which, while an AzctlApp is running
+    # under run_test(), Textual transparently redirects to its own App._print
+    # so it can capture stray prints. On a Windows CI runner that redirect's
+    # real underlying stream uses the legacy 'cp1252' console codepage, which
+    # can't encode the box-drawing/bullet glyphs these renderables use,
+    # raising UnicodeEncodeError -- a test-tooling bug (a helper accidentally
+    # depending on the real stdout's encoding), not anything about AzctlApp's
+    # own rendering.
+    console = Console(record=True, width=width, file=io.StringIO())
     console.print(renderable)
     return console.export_text()
 
@@ -294,7 +305,7 @@ def test_button_bar_destructive_buttons_render_in_red():
     test_render.py) so this file also documents the exact BEHAVIOR.md claim
     the App-level test above depends on."""
     bar = azctl.render_button_bar(0)
-    console = Console(record=True, width=140)
+    console = Console(record=True, width=140, file=io.StringIO())
     console.print(bar)
     segments = list(console.render(bar))
     danger_labels = [b.label for b in azctl.BUTTONS if b.danger]
@@ -609,8 +620,6 @@ async def test_c_copies_valid_osc52_of_the_selected_connection_string(monkeypatc
 
 
 def test_osc52_payload_decodes_to_the_connection_string():
-    import io
-
     text = azctl.connection_string("blob", azctl.Config(blob_port=19191))
     sink = io.StringIO()
     azctl.copy_osc52(text, stream=sink)

@@ -1,5 +1,6 @@
 """Snapshot-style tests of the pure render functions (no TTY, recorded console)."""
 
+import io
 import time
 
 from rich.console import Console
@@ -8,7 +9,13 @@ import azctl
 
 
 def export(renderable, width=100, height=None):
-    console = Console(record=True, width=width, height=height)
+    # file=io.StringIO(): a record=True Console still physically writes to
+    # its `file` in addition to recording -- an explicit in-memory sink means
+    # this never touches the real stdout (whose encoding is whatever the
+    # terminal/OS default is, e.g. legacy cp1252 on a Windows CI runner,
+    # which can't represent the box-drawing/bullet glyphs these renderables
+    # use) even if nothing here happens to redirect stdout today.
+    console = Console(record=True, width=width, height=height, file=io.StringIO())
     console.print(renderable)
     return console.export_text()
 

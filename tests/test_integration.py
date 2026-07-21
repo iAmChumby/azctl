@@ -5,6 +5,7 @@ that intentionally never install Node/Azurite -- see the bootstrap-smoke
 job for the one place CI does).
 """
 
+import io
 import re
 import shutil
 import subprocess
@@ -71,7 +72,10 @@ def _azurite_node_pids():
 
 
 def _export(renderable, width=160):
-    console = Console(record=True, width=width)
+    # file=io.StringIO(): see the identical comment on test_tui.py's export()
+    # -- avoids a Windows UnicodeEncodeError when this runs while AzctlApp
+    # has redirected sys.stdout through its own App._print.
+    console = Console(record=True, width=width, file=io.StringIO())
     console.print(renderable)
     return console.export_text()  # styles=False: plain text, ANSI stripped
 
