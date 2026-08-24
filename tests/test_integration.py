@@ -15,7 +15,6 @@ import time
 import psutil
 import pytest
 from rich.console import Console
-from textual.coordinate import Coordinate
 
 import azctl
 from helpers import free_port, make_config, wait_for
@@ -82,8 +81,16 @@ def _export(renderable, width=160):
 
 
 def _table_cell(app, row, col):
-    table = app.query_one("#table")
-    return table.get_cell_at(Coordinate(row, col))
+    """The per-service card content, addressed like the old table cells:
+    row selects the service, col 1 is its status text."""
+    name = azctl.SERVICE_ORDER[row]
+    card = app.query_one("#card-%s" % name)
+    return card.content
+
+
+def _logview_text(app):
+    lv = app.query_one("#logview")
+    return "\n".join(strip.text for strip in lv.lines)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based orphan check is POSIX-only")
@@ -138,16 +145,16 @@ async def test_real_azurite_dashboard_full_lifecycle(tmp_path):
             started_pids = {v.pid for v in manager.views() if v.pid is not None}
             assert len(started_pids) == 3
 
-            # Now let the DataTable itself catch up and confirm the SAME
+            # Now let the cards themselves catch up and confirm the SAME
             # thing at the UI level (poll -- the refresh tick is 0.1s).
             table_ready = False
             expected = "%s %s" % (azctl.STATE_SYMBOLS[azctl.RUNNING], azctl.RUNNING)
             for _ in range(100):
                 await pilot.pause(0.1)
-                if all(_table_cell(app, i, 1).plain == expected for i in range(3)):
+                if all(expected in _table_cell(app, i, 1).plain for i in range(3)):
                     table_ready = True
                     break
-            assert table_ready, "DataTable never showed all three rows as running"
+            assert table_ready, "service cards never showed all three as running"
 
             # 2. header shows a real azurite version -------------------------
             version_seen = False
@@ -195,7 +202,7 @@ async def test_real_azurite_dashboard_full_lifecycle(tmp_path):
             ]
             assert set(arrival_order) == set(azctl.SERVICE_ORDER)
 
-            out = _export(app.query_one("#logpanel").content)
+            out = _logview_text(app)
             for name in azctl.SERVICE_ORDER:
                 assert "[%s] " % name in out, out
             # The rendered order must match the merged store's arrival order.

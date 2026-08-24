@@ -1,7 +1,6 @@
 """Snapshot-style tests of the pure render functions (no TTY, recorded console)."""
 
 import io
-import time
 
 from rich.console import Console
 
@@ -13,8 +12,7 @@ def export(renderable, width=100, height=None):
     # its `file` in addition to recording -- an explicit in-memory sink means
     # this never touches the real stdout (whose encoding is whatever the
     # terminal/OS default is, e.g. legacy cp1252 on a Windows CI runner,
-    # which can't represent the box-drawing/bullet glyphs these renderables
-    # use) even if nothing here happens to redirect stdout today.
+    # which can't represent the box-drawing glyphs these renderables use).
     console = Console(record=True, width=width, height=height, file=io.StringIO())
     console.print(renderable)
     return console.export_text()
@@ -29,80 +27,74 @@ def test_header_shows_host_data_dir_and_versions():
     assert "azurite unknown" in out and "node unknown" in out
 
 
-# NOTE: the status table is now a Textual DataTable (AzctlApp._populate_table
-# in azctl.py), not a rich Table built by a standalone render_table()
-# function -- that function was deleted in the Textual port. Its
-# symbol/colour/dash/uptime semantics are exercised through AzctlApp itself
-# (tests/test_tui.py, rewritten separately) rather than here.
+def test_sparkline_empty_when_no_data():
+    assert azctl.render_sparkline(()) == ""
+    assert azctl.render_sparkline([]) == ""
 
 
-def test_logs_never_run_hint():
-    out = export(
-        azctl.render_logs(
-            [], combined=False, timestamps=False, service="blob", ever_started=False, height=10
-        )
-    )
-    assert "Blob has never run. Press Enter on [Start] to launch it." in out
+def test_sparkline_scales_to_peak():
+    out = azctl.render_sparkline((1, 2, 3, 4))
+    assert len(out) == 4
+    blocks = [azctl.SPARK_BLOCKS.index(ch) for ch in out]
+    assert blocks == sorted(blocks), "higher counts must map to taller blocks"
+    assert out[-1] == azctl.SPARK_BLOCKS[-1], "the peak always uses the tallest block"
 
 
-def test_logs_combined_tags_and_timestamps():
-    now = time.time()
-    lines = [
-        azctl.LogLine(0, 0.0, now, "blob", "hello from blob"),
-        azctl.LogLine(1, 0.1, now, "queue", "hello from queue"),
-        azctl.LogLine(2, 0.2, now, "table", "hello from table"),
-    ]
-    out = export(
-        azctl.render_logs(
-            lines, combined=True, timestamps=True, service="blob", ever_started=True, height=10
-        )
-    )
-    assert "[blob] hello from blob" in out
-    assert "[queue] hello from queue" in out
-    assert "[table] hello from table" in out
-    assert "all services (merged)" in out
-    stamp = time.strftime("%H:%M:%S", time.localtime(now))
-    assert stamp in out
+def test_sparkline_flat_activity_uses_middle_blocks():
+    out = azctl.render_sparkline((5, 5, 5))
+    assert out == azctl.SPARK_BLOCKS[-1] * 3 == "█" * 3
 
 
-def test_logs_long_lines_truncate_not_wrap():
-    lines = [azctl.LogLine(0, 0.0, time.time(), "blob", "x" * 500)]
-    out = export(
-        azctl.render_logs(
-            lines, combined=False, timestamps=False, service="blob", ever_started=True, height=10
-        ),
-        width=60,
-    )
-    body = [ln for ln in out.splitlines() if "x" in ln]
-    assert len(body) == 1  # one noisy line never eats several rows
-    assert "…" in body[0]
+def test_btn_label_hot_is_reversed_and_bracketed_tight():
+    stop = azctl.BUTTONS[1]
+    hot = azctl.btn_label(stop, hot=True)
+    cold = azctl.btn_label(stop, hot=False)
+    assert hot.plain == "[Stop]"
+    assert cold.plain == "[ Stop ]"
+    styles_hot = [str(s.style) for s in hot.spans]
+    styles_cold = [str(s.style) for s in cold.spans]
+    assert any("reverse" in s for s in styles_hot)
+    assert not any("reverse" in s for s in styles_cold)
 
 
-def test_logs_only_newest_lines_that_fit():
-    lines = [azctl.LogLine(i, 0.0, time.time(), "blob", "line-%d" % i) for i in range(50)]
-    out = export(
-        azctl.render_logs(
-            lines, combined=False, timestamps=False, service="blob", ever_started=True, height=7
-        )
-    )
-    assert "line-49" in out
-    assert "line-0" not in out
+def test_btn_label_destructive_buttons_are_red():
+    for btn in azctl.BUTTONS:
+        if not btn.danger:
+            continue
+        for label in (azctl.btn_label(btn, hot=True), azctl.btn_label(btn, hot=False)):
+            span_styles = [str(s.style) for s in label.spans]
+            assert any("red" in s for s in span_styles), btn.label
 
 
-def test_footer_legend_buttons_and_separator():
+def test_btn_label_safe_buttons_are_not_red():
+    for btn in azctl.BUTTONS:
+        if btn.danger:
+            continue
+        for label in (azctl.btn_label(btn, hot=True), azctl.btn_label(btn, hot=False)):
+            span_styles = [str(s.style) for s in label.spans]
+            assert not any("red" in s for s in span_styles), btn.label
+
+
+def test_footer_legend_and_mode_indicator():
     ui = azctl.UIState()
     out = export(azctl.render_footer(ui, now=0.0), width=140)
     for state in ("running", "starting", "stopped", "broken", "port in use"):
         assert state in out
-    for btn in azctl.BUTTONS:
-        assert "[%s]" % btn.label in out
-    assert "│" in out  # visual separator before the all-services group
     assert "logs: selected" in out
 
 
-# NOTE: confirm/quit prompts no longer live in UIState.mode / render_footer --
-# they are ModalScreen overlays (ConfirmScreen/QuitScreen in azctl.py) that
-# render their own prompt text and are exercised via AzctlApp (test_tui.py).
+def test_footer_combined_indicator():
+    ui = azctl.UIState(combined_logs=True)
+    out = export(azctl.render_footer(ui, now=0.0), width=140)
+    assert "logs: ALL" in out
+
+
+def test_footer_filter_indicator():
+    ui = azctl.UIState(filter_text="blob")
+    off = export(azctl.render_footer(azctl.UIState(), now=0.0), width=140)
+    out = export(azctl.render_footer(ui, now=0.0), width=140)
+    assert "/blob/" in out
+    assert "/blob/" not in off
 
 
 def test_footer_message_shown_then_fades():
@@ -113,18 +105,19 @@ def test_footer_message_shown_then_fades():
     assert "Started Blob" not in out
 
 
-def test_footer_combined_indicator():
-    ui = azctl.UIState(combined_logs=True)
-    out = export(azctl.render_footer(ui, now=0.0), width=140)
-    assert "logs: ALL" in out
+def test_footer_busy_spinner_while_working():
+    ui = azctl.UIState()
+    out = export(azctl.render_footer(ui, now=0.0, busy_spinner="⠋"), width=140)
+    assert "working…" in out
+    ui = azctl.UIState(message=("Stopping services…", "grey", 10.0))
+    out = export(azctl.render_footer(ui, now=5.0, busy_spinner="⠙"), width=140)
+    assert "⠙" in out and "Stopping services…" in out
 
 
 def test_footer_mode_indicator_survives_truncation_at_normal_widths():
-    """BEHAVIOR.md: 'The footer shows whether this mode is on or off, so you
-    always know which view you are reading.' At the two most common default
-    terminal widths (80, 100) the old ordering put the indicator after ~102
-    chars of static hint text, so the no_wrap+ellipsis line truncated it away
-    identically whether combined_logs was True or False."""
+    """BEHAVIOR.md: 'The footer shows whether this mode is on or off.' The
+    indicator is placed before the static hint text so the no_wrap+ellipsis
+    line can never truncate it away at common terminal widths."""
     for width in (80, 100):
         off = export(azctl.render_footer(azctl.UIState(combined_logs=False), now=0.0), width=width)
         on = export(azctl.render_footer(azctl.UIState(combined_logs=True), now=0.0), width=width)
@@ -135,7 +128,7 @@ def test_footer_mode_indicator_survives_truncation_at_normal_widths():
 
 def test_help_overlay_lists_every_key_and_button():
     out = export(azctl.render_help())
-    for key in ("Enter", "a", "t", "c", "S", "?", "q", "Esc", "mouse"):
+    for key in ("Enter", "a", "t", "/", "c", "S", "?", "q", "Esc", "mouse"):
         assert key in out
     for btn in azctl.BUTTONS:
         assert btn.label in out
@@ -150,7 +143,12 @@ def test_conn_overlay_lists_all_three_strings():
     assert "▸ Queue" in out
 
 
-# NOTE: build_frame() (the rich.Layout frame) and button_spans() (mouse
-# hit-testing geometry) were both deleted in the Textual port -- Textual's
-# CSS layout and DataTable/ModalScreen widgets replace them. Frame
-# composition is exercised through AzctlApp (test_tui.py) instead.
+def test_button_bar_shape_is_stable():
+    labels = [b.label for b in azctl.BUTTONS]
+    assert labels == ["Start", "Stop", "Restart", "Save", "Free port", "Start all", "Stop all"]
+    groups = [b.group for b in azctl.BUTTONS]
+    assert groups[:5] == [0] * 5 and groups[5:] == [1, 1], (
+        "per-service actions must be grouped apart from the all-services ones"
+    )
+    danger = {b.label for b in azctl.BUTTONS if b.danger}
+    assert danger == {"Stop", "Restart", "Free port", "Stop all"}

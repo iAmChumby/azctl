@@ -264,16 +264,20 @@ try:
     from textual import work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
     from textual.css.query import NoMatches
+    from textual.message import Message
     from textual.screen import ModalScreen
-    from textual.widgets import DataTable, Static
+    from textual.containers import VerticalScroll
+    from textual.widgets import Input, RichLog, Static
 
     _HAVE_DEPS = True
 except ImportError:
     psutil = None
     Console = Group = Live = Panel = Table = Text = None
-    work = App = ComposeResult = Binding = ModalScreen = None
-    DataTable = Static = NoMatches = None
+    work = App = ComposeResult = Binding = Message = ModalScreen = None
+    Horizontal = Vertical = VerticalScroll = None
+    Input = RichLog = Static = NoMatches = None
     _HAVE_DEPS = False
 
 
@@ -1010,7 +1014,7 @@ def cmd_free_ports(config: Config, assume_yes: bool = False, service=None) -> in
     return 0 if all_free else 1
 
 
-# --- TUI: UIState, pure render functions, AzctlApp ----------------------- §9
+# --- TUI: UIState, pure render functions, widgets, screens, AzctlApp ----- §9
 @dataclass
 class Button:
     label: str
@@ -1018,6 +1022,8 @@ class Button:
     danger: bool
     group: int
 
+
+MSG_STYLES = {"green": "green", "red": "bold red", "yellow": "yellow", "grey": "grey50"}
 
 BUTTONS = (
     Button("Start", "start", False, 0),
@@ -1029,9 +1035,9 @@ BUTTONS = (
     Button("Stop all", "stop_all", True, 1),
 )
 
-GROUP_SEPARATOR = " │ "
-
-MSG_STYLES = {"green": "green", "red": "bold red", "yellow": "yellow", "grey": "grey50"}
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+SPARK_CAPACITY = 48
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 @dataclass
@@ -1040,49 +1046,29 @@ class UIState:
     button: int = 0
     combined_logs: bool = False
     timestamps: bool = False
+    filter_text: str = ""
     message: "tuple | None" = None  # (text, style, expires_at)
     versions: "tuple" = ("unknown", "unknown")
+
+
+def render_sparkline(counts) -> str:
+    """Mini activity graph of recent log throughput; '' when there is no data."""
+    if not counts:
+        return ""
+    peak = max(max(counts), 1)
+    top = len(SPARK_BLOCKS) - 1
+    return "".join(SPARK_BLOCKS[min(top, c * top // peak)] for c in counts)
 
 
 def render_header(config: Config, versions) -> "Panel":
     azurite_ver, node_ver = versions
     text = Text(no_wrap=True, overflow="ellipsis")
+    text.append(" ◆ ", style="bold magenta")
     text.append("azctl", style="bold cyan")
     text.append(" · Azurite Storage Emulator", style="bold")
     text.append("   host %s · data %s" % (config.host, config.data_dir))
     text.append("   azurite %s · node %s" % (azurite_ver, node_ver), style="grey50")
-    return Panel(text)
-
-
-def render_logs(lines, *, combined, timestamps, service, ever_started, height) -> "Panel":
-    inner = max(1, height - 2)  # panel borders
-    shown = lines[-inner:]
-    text = Text(no_wrap=True, overflow="ellipsis")
-    if not shown:
-        if combined:
-            text.append("No output from any service yet.", style="grey50")
-        elif not ever_started:
-            text.append(
-                "%s has never run. Press Enter on [Start] to launch it." % service.capitalize(),
-                style="grey50",
-            )
-        else:
-            text.append("(no output yet)", style="grey50")
-    else:
-        for line in shown:
-            if len(text) > 0:
-                text.append("\n")
-            if timestamps:
-                stamp = time.strftime("%H:%M:%S ", time.localtime(line.wall))
-                text.append(stamp, style="grey50")
-            if combined:
-                colour = SERVICE_COLOURS.get(line.service, "white")
-                text.append("[%s] " % line.service, style="bold " + colour)
-                text.append(line.text, style=colour)
-            else:
-                text.append(line.text)
-    title = "logs · all services (merged)" if combined else "logs · " + service.capitalize()
-    return Panel(text, title=title, title_align="left")
+    return Panel(text, border_style="cyan")
 
 
 def _legend_text() -> "Text":
@@ -1094,65 +1080,63 @@ def _legend_text() -> "Text":
     return text
 
 
-def render_button_bar(active: int) -> "Text":
-    bar = Text(no_wrap=True, overflow="ellipsis")
-    for i, btn in enumerate(BUTTONS):
-        if i == 0:
-            sep = ""
-        elif BUTTONS[i - 1].group != btn.group:
-            sep = GROUP_SEPARATOR
-        else:
-            sep = " "
-        bar.append(sep)
-        if i == active:
-            style = "bold red reverse" if btn.danger else "bold reverse"
-        else:
-            style = "red" if btn.danger else ""
-        bar.append("[" + btn.label + "]", style=style)
-    return bar
+def btn_label(btn: Button, hot: bool) -> "Text":
+    text = Text(no_wrap=True)
+    if hot:
+        text.append("[%s]" % btn.label, style=("bold red reverse" if btn.danger else "bold reverse"))
+    else:
+        text.append("[ %s ]" % btn.label, style=("red" if btn.danger else "grey70"))
+    return text
 
 
-def render_footer(ui: UIState, now: float) -> "Group":
-    rows = [_legend_text(), render_button_bar(ui.button)]
-    # The mode indicator goes first: at narrow/normal terminal widths the
-    # no_wrap+ellipsis line truncates from the right, and this is the one
-    # piece of state BEHAVIOR.md says you must always be able to read ("the
-    # footer shows whether this mode is on or off"). Put the low-priority
-    # static hint text after it so *that* is what gets eaten by the ellipsis.
+def render_footer(ui: UIState, now: float, busy_spinner: str = "") -> "Group":
+    rows = [_legend_text()]
     hints = Text(no_wrap=True, overflow="ellipsis")
     hints.append("logs: ", style="grey50")
     if ui.combined_logs:
         hints.append("ALL", style="bold yellow")
     else:
         hints.append("selected", style="grey50")
+    if ui.filter_text:
+        hints.append("   filter: ", style="grey50")
+        hints.append("/%s/" % ui.filter_text, style="bold cyan")
     hints.append(
-        "   ↑↓ service · ←→ buttons · Enter run · a all-logs · t times · "
-        "c conn str · S save all · ? help · q quit",
+        "   ↑↓ service · ←→ actions · Enter run · a all-logs · t times · "
+        "/ filter · c conn str · S save all · ? help · q quit",
         style="grey50",
     )
     rows.append(hints)
     if ui.message is not None and ui.message[2] > now:
         rows.append(
-            Text(ui.message[0], style=MSG_STYLES.get(ui.message[1], ""), no_wrap=True, overflow="ellipsis")
+            Text(
+                (busy_spinner + " " if busy_spinner else "") + ui.message[0],
+                style=MSG_STYLES.get(ui.message[1], ""),
+                no_wrap=True,
+                overflow="ellipsis",
+            )
         )
+    elif busy_spinner:
+        rows.append(Text(busy_spinner + " working…", style="bold cyan", no_wrap=True))
     else:
         rows.append(Text(""))
     return Group(*rows)
 
 
 HELP_ROWS = (
-    ("↑ / ↓", "Select a service — the table marker and log panel follow instantly"),
-    ("← / →", "Move the highlight along the button bar"),
-    ("Enter", "Run the highlighted button"),
+    ("↑ / ↓", "Select a service — the highlighted card and the log panel follow instantly"),
+    ("← / →", "Move the highlight along the action bar"),
+    ("Enter", "Run the highlighted action"),
     ("a", "Toggle the merged view of all three logs (colour-tagged, arrival order)"),
     ("t", "Toggle timestamps on log lines"),
-    ("c", "Show connection strings and copy the selected one (OSC 52)"),
+    ("/", "Open the log filter bar; type to narrow lines live, Esc clears it"),
+    ("c", "Show connection strings; the selected one is copied (OSC 52)"),
     ("S", "Save the merged all-services log to azurite-all.log"),
     ("?", "This help overlay"),
-    ("Esc", "Cancel a confirmation / close an overlay"),
+    ("Esc", "Cancel a confirmation / clear the filter / close an overlay"),
     ("q", "Quit — asks what to do with services that are still running"),
     ("Ctrl+C / Ctrl+Q", "Same as q — asks what to do with services that are still running"),
-    ("mouse", "Click a table row to select it"),
+    ("mouse", "Click a service card to select it; click an action to run it"),
+    ("Ctrl+P", "Command palette (built into Textual)"),
     ("", ""),
     ("Start", "Start the selected service"),
     ("Stop", "Stop the selected service (asks first)"),
@@ -1173,40 +1157,67 @@ def render_help() -> "Panel":
     return Panel(table, title="help — press any key to close", title_align="left")
 
 
-def render_conn(config: Config, selected: int) -> "Panel":
-    text = Text(no_wrap=True, overflow="ellipsis")
+def render_conn(config: Config, selected: int) -> "Text":
+    text = Text()
     for i, name in enumerate(SERVICE_ORDER):
         marker = "▸ " if i == selected else "  "
         text.append("%s%s\n" % (marker, name.capitalize()), style="bold " + SERVICE_COLOURS[name])
-        text.append("    %s\n" % connection_string(name, config))
+        text.append("    %s\n\n" % connection_string(name, config))
     text.append(
-        "\nThe selected service's string was copied to the clipboard via OSC 52.\n"
-        "Press any key to close.",
+        "The selected service's string was copied to the clipboard via OSC 52.\n"
+        "Esc closes · click a COPY button to copy another service.",
         style="grey50",
     )
-    return Panel(text, title="connection strings", title_align="left")
+    return text
 
 
-# --- ModalScreens: confirm / quit / help / connection-strings overlays ----
-# The TUI classes below subclass Textual base classes (App, ModalScreen,
-# Static, DataTable) and use Binding(...)/@work(...) at class-body-
+# The TUI classes below subclass Textual base classes at class-body-
 # evaluation time -- all guarded-None when textual isn't importable. Gating
-# the whole block behind _HAVE_DEPS means a deps-less process (status/
-# watch/free-ports/--help) never executes a `class Foo(None):` statement.
-# run_dashboard() (below, always defined) only ever references AzctlApp
-# once _HAVE_DEPS is guaranteed True (main() bootstraps+re-execs first for
-# any command that needs it), so this is safe.
+# the whole block behind _HAVE_DEPS means a deps-less process (status/watch/
+# free-ports/--help) never executes `class Foo(None):`.
 if _HAVE_DEPS:
+
+    class ServiceCard(Static):
+        """One service's health at a glance; click to select."""
+
+        can_focus = False
+
+        class Clicked(Message):
+            def __init__(self, service: str) -> None:
+                super().__init__()
+                self.service = service
+
+        def __init__(self, service: str, **kwargs) -> None:
+            super().__init__(classes="service-card", **kwargs)
+            self.service = service
+
+        def on_click(self) -> None:
+            self.post_message(self.Clicked(self.service))
+
+    class ActionButton(Static):
+        """One entry of the keyboard-driven action bar; also clickable."""
+
+        can_focus = False
+
+        class Triggered(Message):
+            def __init__(self, index: int) -> None:
+                super().__init__()
+                self.index = index
+
+        def __init__(self, index: int, btn: Button) -> None:
+            super().__init__(classes="action-button")
+            self.index = index
+            self.btn = btn
+
+        def on_click(self) -> None:
+            self.post_message(self.Triggered(self.index))
+
     class _ModalBody(Static):
         """Static content, but focusable.
 
-        Textual routes key events along the *focused widget's* own ancestor
-        chain (widget -> ... -> its Screen -> App) — pushing a ModalScreen does
-        not by itself move focus into it. A plain (non-focusable) Static would
-        leave focus sitting on whatever had it on the screen underneath (e.g.
-        the DataTable), so the modal's own on_key would simply never be
-        reached. Focusing this widget on mount makes the modal screen part of
-        the chain that actually receives the next keypress.
+        Textual routes key events along the *focused widget's* ancestor chain;
+        pushing a ModalScreen does not by itself move focus into it, so a
+        modal whose body can't hold focus would never see the next keypress.
         """
 
         can_focus = True
@@ -1214,20 +1225,37 @@ if _HAVE_DEPS:
         def on_mount(self) -> None:
             self.focus()
 
-
     class HelpScreen(ModalScreen):
         """Read-only overlay; any key closes it."""
 
+        DEFAULT_CSS = """
+        HelpScreen { align: center middle; }
+        HelpScreen #help_scroll {
+            width: 100; max-width: 92%; height: auto; max-height: 85%;
+            background: $surface; border: round $primary; padding: 0 1;
+        }
+        """
+
         def compose(self) -> ComposeResult:
-            yield _ModalBody(render_help())
+            with VerticalScroll(id="help_scroll"):
+                yield _ModalBody(render_help())
 
         def on_key(self, event) -> None:
             event.stop()
             self.dismiss()
 
-
     class ConnScreen(ModalScreen):
-        """Read-only overlay; any key closes it."""
+        """Connection strings for all three services, with copy actions."""
+
+        DEFAULT_CSS = """
+        ConnScreen { align: center middle; }
+        ConnScreen #conn_dialog {
+            width: 100%; max-width: 110; height: auto;
+            background: $surface; border: round $primary; padding: 0 1;
+        }
+        ConnScreen #conn_choices { height: auto; align-horizontal: center; }
+        ConnScreen ActionButton { width: auto; margin: 0 1 1 1; padding: 0 2; }
+        """
 
         def __init__(self, config: Config, selected: int) -> None:
             super().__init__()
@@ -1235,21 +1263,28 @@ if _HAVE_DEPS:
             self.selected = selected
 
         def compose(self) -> ComposeResult:
-            yield _ModalBody(render_conn(self.config, self.selected))
+            with Vertical(id="conn_dialog"):
+                yield _ModalBody(render_conn(self.config, self.selected))
+                with Horizontal(id="conn_choices"):
+                    for i, name in enumerate(SERVICE_ORDER):
+                        yield ActionButton(i, Button("Copy " + name.capitalize(), "copy", False, 0))
 
         def on_key(self, event) -> None:
             event.stop()
             self.dismiss()
 
+        def on_action_button_triggered(self, event: "ActionButton.Triggered") -> None:
+            event.stop()
+            name = SERVICE_ORDER[event.index]
+            copy_osc52(connection_string(name, self.config))
+            self.app.show("Copied %s connection string to clipboard." % name.capitalize(), "green")
 
     class ConfirmScreen(ModalScreen):
         """dismiss(True) on Enter; dismiss(False) on literally anything else.
 
         BEHAVIOR.md: "The question appears in the footer." ModalScreen's own
         DEFAULT_CSS only dims the background -- it does not position content
-        -- so without this the body would render as an unstyled strip pinned
-        to the top of the screen. Docking it to the bottom, at the footer's
-        own height, puts the prompt where the contract says it belongs.
+        -- so the body is docked to the bottom, at the footer's own height.
         """
 
         DEFAULT_CSS = """
@@ -1275,30 +1310,45 @@ if _HAVE_DEPS:
             event.stop()
             self.dismiss(event.key == "enter")
 
+    class QuitDialog(Vertical):
+        """Focusable host for the three-way quit question.
+
+        Without a focused widget inside the modal, key events keep flowing to
+        whatever held focus on the screen underneath and QuitScreen.on_key is
+        never reached (same reason _ModalBody exists).
+        """
+
+        can_focus = True
+
+        def on_mount(self) -> None:
+            self.focus()
 
     class QuitScreen(ModalScreen):
-        """dismiss('stop'|'detach') on Enter/n; dismiss('stay') on Esc; every OTHER
-        key is swallowed and the screen stays open — this is NOT the same rule as
-        ConfirmScreen (three answers only, BEHAVIOR.md).
+        """Three-way goodbye: Enter/'Stop & quit', n/'Leave running', Esc/'Stay'.
 
-        Same footer-docking rationale as ConfirmScreen above.
+        Every OTHER key is swallowed and the screen stays open — three answers
+        only, which is deliberately NOT ConfirmScreen's rule (BEHAVIOR.md).
         """
 
         DEFAULT_CSS = """
-        QuitScreen #modal_body { dock: bottom; height: 4; width: 100%; }
+        QuitScreen { align: center middle; }
+        QuitScreen #quit_dialog {
+            width: 64; height: auto; background: $surface;
+            border: round yellow; padding: 1 2;
+        }
+        QuitScreen #quit_title { text-style: bold; color: yellow; margin-bottom: 1; }
+        QuitScreen #quit_choices { height: auto; align-horizontal: center; margin-top: 1; }
+        QuitScreen ActionButton { width: auto; margin: 0 1; padding: 0 2; }
         """
 
         def compose(self) -> ComposeResult:
-            yield _ModalBody(
-                Text(
-                    "Services are still running — Enter: stop them and quit · "
-                    "n: leave them running and quit · Esc: stay",
-                    style="bold yellow",
-                    no_wrap=True,
-                    overflow="ellipsis",
-                ),
-                id="modal_body",
-            )
+            with QuitDialog(id="quit_dialog"):
+                yield Static("Services are still running.", id="quit_title")
+                yield Static("What should happen to them when the dashboard closes?")
+                with Horizontal(id="quit_choices"):
+                    yield ActionButton(0, Button("Stop & quit", "stop", False, 0))
+                    yield ActionButton(1, Button("Leave running", "detach", False, 0))
+                    yield ActionButton(2, Button("Stay", "stay", False, 0))
 
         def on_key(self, event) -> None:
             event.stop()
@@ -1310,20 +1360,43 @@ if _HAVE_DEPS:
                 self.dismiss("stay")
             # else: deliberately ignored — three answers only, screen stays open
 
+        def on_action_button_triggered(self, event: "ActionButton.Triggered") -> None:
+            event.stop()
+            self.dismiss(event.btn.action)
 
     class AzctlApp(App):
         """Owns UIState + a ServiceManager. All impure work (spawning, killing,
         polling ports) happens in ServiceManager or in a threaded worker; this
-        class only wires input, the refresh tick, and the four regions together.
+        class only wires input, the refresh tick, and the regions together.
         """
 
         CSS = """
         Screen { layout: vertical; }
-        #header   { height: 3; }
-        #table    { height: 5; }
-        #logpanel { height: 1fr; }
-        #footer   { height: 4; }
+        #header { height: 3; }
+        #cards { height: auto; margin: 0 1; }
+        ServiceCard {
+            width: 1fr; height: auto; margin: 1 0 1 1; padding: 0 1;
+            border: round $panel; background: $surface;
+        }
+        ServiceCard.selected { background: $boost; text-style: bold; }
+        ServiceCard.state-running { border: round green; }
+        ServiceCard.state-starting { border: round yellow; }
+        ServiceCard.state-stopped { border: round grey; }
+        ServiceCard.state-broken { border: round red; }
+        ServiceCard.state-port_in_use { border: round magenta; }
+        #logpanel { height: 1fr; margin: 0 1; }
+        #logview { border: round $panel; background: $surface; padding: 0 1; }
+        #logfilter { display: none; border-title-color: cyan; }
+        #logfilter.visible { display: block; }
+        #btnrow { height: 1; margin: 0 1; }
+        ActionButton { width: auto; padding: 0 1; }
+        #footer { height: 3; margin: 0 1; }
         """
+
+        # The dashboard is keyboard-driven from the app level; letting
+        # textual's default AUTO_FOCUS grab the log filter Input on mount
+        # would silently swallow every binding into a text field.
+        AUTO_FOCUS = None
 
         BINDINGS = [
             Binding("up", "select_prev", show=False),
@@ -1333,17 +1406,17 @@ if _HAVE_DEPS:
             Binding("enter", "activate", show=False),
             Binding("a", "toggle_merged", show=False),
             Binding("t", "toggle_timestamps", show=False),
+            Binding("slash", "focus_filter", show=False),
+            Binding("escape", "clear_filter", show=False),
             Binding("c", "show_conn", show=False),
             Binding("S", "save_merged", show=False),
             Binding("question_mark", "show_help", show=False),
             Binding("q", "quit_app", show=False),
             Binding("ctrl+c", "interrupt", show=False),
-            # Textual's base App class ships a built-in, always-live
-            # Binding("ctrl+q", "quit", priority=True) that otherwise shadows
-            # this one and exits with zero confirmation, bypassing the
-            # three-way stop/detach/stay question entirely (a stray-keystroke
-            # regression BEHAVIOR.md's confirmation contract is meant to
-            # prevent). priority=True is required so *this* binding wins.
+            # Textual's base App ships a built-in, always-live
+            # Binding("ctrl+q", "quit", priority=True) that otherwise exits
+            # with zero confirmation; priority=True lets this one win so the
+            # three-way stop/detach/stay question can't be bypassed.
             Binding("ctrl+q", "quit_app", show=False, priority=True),
         ]
 
@@ -1371,46 +1444,50 @@ if _HAVE_DEPS:
             self._pending_bell = False
             self._buffered_alert_message = None
             self._mounted = False
-            self._expected_row_highlights = collections.deque()
+            self._last_seq = -1
+            self._log_placeholder = False
+            self._spinner = itertools.cycle(SPINNER_FRAMES)
+            self._spark = {name: collections.deque(maxlen=SPARK_CAPACITY) for name in SERVICE_ORDER}
+            self._spark_last_seq = {name: -1 for name in SERVICE_ORDER}
 
         # -- composition & mount ----------------------------------------------
         def compose(self) -> ComposeResult:
             yield Static(id="header")
-            # can_focus=False: BEHAVIOR.md's keyboard contract (up/down select a
-            # service, Enter always activates the highlighted button) must win
-            # over DataTable's own built-in cursor/row-activation bindings.
-            # Textual resolves key bindings starting at the *focused* widget and
-            # walking up its ancestor chain; if DataTable could hold focus, its
-            # own bindings for the same keys would be found first and shadow
-            # AzctlApp's. Native mouse row-click selection (on_data_table_row_
-            # selected below) still works without keyboard focus.
-            table = DataTable(id="table", cursor_type="row")
-            table.can_focus = False
-            yield table
-            yield Static(id="logpanel")
+            with Horizontal(id="cards"):
+                for name in SERVICE_ORDER:
+                    yield ServiceCard(name, id="card-%s" % name)
+            with Vertical(id="logpanel"):
+                yield RichLog(id="logview", wrap=False, max_lines=3 * LOG_CAPACITY, auto_scroll=True)
+                yield Input(id="logfilter", placeholder="filter logs… (Esc clears, Enter keeps)")
+            with Horizontal(id="btnrow"):
+                for i, btn in enumerate(BUTTONS):
+                    yield ActionButton(i, btn)
             yield Static(id="footer")
 
         def on_mount(self) -> None:
-            table = self.query_one("#table", DataTable)
-            table.add_columns("Service", "Status", "Port", "PID", "Uptime")
+            # RichLog is focusable by default; if it ever holds focus it
+            # would consume ↑↓ and break the keyboard contract.
+            self.query_one("#logview", RichLog).can_focus = False
             self._install_os_signal_handlers()
             threading.Thread(target=self._probe_versions, daemon=True).start()
-            self.set_interval(0.1, self._on_tick)  # same 10 Hz cadence as before
+            self.set_interval(0.1, self._on_tick)
             if self.start_all_on_entry:
                 msg, style = self._aggregate(self.manager.start_all())
                 self.show(msg, style)
             self._mounted = True
+            self._reset_log_view()
             self._refresh_widgets()
 
         def _probe_versions(self) -> None:
             versions = detect_versions()
             try:
-                self.call_from_thread(self._set_versions, versions)
+                # A closed loop makes call_from_thread raise *after* it has
+                # built its internal coroutine, leaking an "never awaited"
+                # RuntimeWarning into stderr -- skip the call entirely once
+                # the app is winding down.
+                if self._loop is not None and not self._loop.is_closed():
+                    self.call_from_thread(self._set_versions, versions)
             except Exception:  # noqa: BLE001 - app may already be shutting down
-                # A background daemon thread racing app exit (the version probe
-                # can still be in flight when the user quits within the first
-                # tick): call_from_thread onto a closed event loop must never
-                # surface as an unhandled exception in this thread.
                 pass
 
         def _set_versions(self, versions) -> None:
@@ -1429,56 +1506,81 @@ if _HAVE_DEPS:
                     style = result_style
             return " ".join(msg for _ok, msg, _style in results), style
 
+        def _toast(self, text: str, style: str) -> None:
+            severity = {"red": "error", "yellow": "warning"}.get(style, "information")
+            try:
+                self.notify(text, title="azctl", severity=severity, timeout=5)
+            except Exception:  # noqa: BLE001 - notifications are garnish
+                pass
+
         # -- refresh tick ---------------------------------------------------------
-        def _populate_table(self, views) -> None:
-            table = self.query_one("#table", DataTable)
-            # clear() forces the cursor back to row 0, and the move_cursor()
-            # below restores it to ui.selected -- both are genuine cursor
-            # *moves* whenever the row actually changes, and DataTable posts
-            # a real RowHighlighted for each one (see the comment on
-            # _select_row below). Every ~0.3s refresh tick would otherwise
-            # emit a false "the user highlighted row 0" event that
-            # on_data_table_row_highlighted can't tell apart from a genuine
-            # click -- _expect_cursor_move() pre-registers exactly the moves
-            # WE are about to cause (only when they'll actually fire, mirroring
-            # DataTable's own old-coordinate != new-coordinate check) so that
-            # handler can filter them out and only react to real ones.
-            if table.cursor_coordinate.row != 0:
-                self._expect_cursor_move(0)
-            table.clear()
+        def _card_text(self, view: ServiceView, spark: str) -> Text:
+            selected = SERVICE_ORDER[self.ui.selected] == view.name
+            state = view.state
+            colour = STATE_COLOURS[state]
+            text = Text()
+            text.append("▸ " if selected else "  ", style="bold cyan")
+            text.append(STATE_SYMBOLS[state] + " " + state + "\n", style="bold " + colour)
+            text.append(view.name.capitalize(), style="bold white")
+            text.append(" · port %d\n" % view.port)
+            if view.pid is not None:
+                text.append("pid %d" % view.pid, style="grey70")
+                if view.uptime is not None:
+                    text.append("  up %s" % format_uptime(view.uptime), style="grey70")
+            elif view.exit_code is not None:
+                text.append("exit %d" % view.exit_code, style="grey70")
+            else:
+                text.append("pid —", style="grey70")
+            if spark:
+                text.append("\n" + spark, style=colour)
+            return text
+
+        def _refresh_cards(self, views) -> None:
             for view in views:
-                table.add_row(
-                    view.name.capitalize(),
-                    Text("%s %s" % (STATE_SYMBOLS[view.state], view.state), style=STATE_COLOURS[view.state]),
-                    str(view.port),
-                    str(view.pid) if view.pid is not None else "—",
-                    format_uptime(view.uptime) if view.uptime is not None else "—",
-                )
-            if table.cursor_coordinate.row != self.ui.selected:
-                self._expect_cursor_move(self.ui.selected)
-            table.move_cursor(row=self.ui.selected)  # clear() resets cursor to 0
+                card = self.query_one("#card-%s" % view.name, ServiceCard)
+                card.update(self._card_text(view, render_sparkline(tuple(self._spark[view.name]))))
+                for cls in ("selected", "state-running", "state-starting",
+                            "state-stopped", "state-broken", "state-port_in_use"):
+                    card.remove_class(cls)
+                card.add_class("state-" + view.state.replace(" ", "_"))
+                # "Starting" cards breathe (triangle-wave opacity); textual's
+                # CSS has no keyframes, so this runs off the refresh tick.
+                if view.state == STARTING:
+                    phase = self.clock() % 1.2 / 1.2
+                    card.styles.opacity = 0.55 + 0.45 * abs(1 - 2 * phase)
+                else:
+                    card.styles.opacity = 1.0
+                if SERVICE_ORDER[self.ui.selected] == view.name:
+                    card.add_class("selected")
+
+        def _refresh_buttons(self) -> None:
+            for i, widget in enumerate(self.query(ActionButton)):
+                widget.update(btn_label(widget.btn, hot=(i == self.ui.button)))
+
+        def _update_spark(self) -> None:
+            """Bucket per-service log arrivals since the last refresh.
+
+            Tracked by global sequence number rather than buffer length, so
+            the graph keeps working after the 2000-line ring buffer wraps.
+            """
+            for name in SERVICE_ORDER:
+                lines = self.manager.logs.lines(name)
+                last = self._spark_last_seq[name]
+                fresh = sum(1 for line in lines if line.seq > last)
+                if lines:
+                    self._spark_last_seq[name] = lines[-1].seq
+                self._spark[name].append(min(fresh, 99))
 
         def _on_tick(self) -> None:
             # set_interval's callback can still be queued for one more beat
-            # while the app is unwinding (Textual clears self._running before
-            # awaiting the rest of its own _shutdown()), which would otherwise
-            # reach _refresh_widgets() and query a widget that's already been
-            # unmounted. Ignoring the tick once we're no longer running keeps
-            # this a plain no-op instead of an unhandled NoMatches escaping
-            # out of the app's message pump.
+            # while the app is unwinding; ignore ticks once we're no longer
+            # running instead of querying unmounted widgets.
             if not self.is_running:
                 return
-            if self._tick_count % 3 == 0:  # ~3.3 Hz, matching the old tick%3==0 gate
-                # manager.refresh() does real socket.create_connection() calls
-                # for each configured port (port_open, up to health_timeout
-                # each) -- against a non-default/unreachable --host this can
-                # genuinely block for a noticeable fraction of a second, which
-                # on the main thread would stall every redraw and keystroke.
-                # Run it on a worker thread instead, same pattern as the
-                # confirmed button actions. Skip starting a new one while
-                # either a previous refresh or a confirmed action is still in
-                # flight, since ServiceManager's per-service state isn't
-                # guarded against being mutated from two threads at once.
+            if self._tick_count % 3 == 0:
+                # manager.refresh() does real socket probes per configured
+                # port, which can block against an unreachable --host; keep
+                # it off the UI thread, one at a time (see _confirm_then_run).
                 if not self._refresh_in_flight and not self._busy:
                     self._refresh_in_flight = True
                     self._refresh_worker()
@@ -1486,8 +1588,6 @@ if _HAVE_DEPS:
             try:
                 self._refresh_widgets()
             except NoMatches:
-                # Belt-and-braces for the same race: the widgets vanished
-                # between the is_running check above and this call.
                 pass
 
         @work(thread=True)
@@ -1500,16 +1600,15 @@ if _HAVE_DEPS:
 
         def _finish_refresh(self, transitions) -> None:
             self._refresh_in_flight = False
+            try:
+                self._update_spark()
+            except Exception:  # noqa: BLE001
+                pass
             broken = [t for t in transitions if t.new == BROKEN]
             if not broken:
                 return
-            # A ConfirmScreen/QuitScreen/HelpScreen/ConnScreen sitting on top
-            # is meant to be an isolated, unambiguous decision point --
-            # BEHAVIOR.md never says an unrelated alert should compete with
-            # it. ModalScreen only dims the base screen (translucent, not an
-            # opaque cover), so without this gate the bell and message would
-            # still visibly/audibly fire underneath an open modal. Buffer
-            # instead and flush once the modal in front is dismissed.
+            # A modal sitting on top is meant to be an isolated decision
+            # point; buffer the bell/message until it is dismissed.
             if len(self.screen_stack) > 1:
                 self._pending_bell = True
                 for t in broken:
@@ -1522,6 +1621,7 @@ if _HAVE_DEPS:
                 reason = self.manager.broken_reason(t.service)
                 if reason:
                     self.show(reason, "red")
+                    self._toast(reason, "red")
 
         def _flush_pending_alerts(self) -> None:
             if self._pending_bell:
@@ -1531,124 +1631,118 @@ if _HAVE_DEPS:
                 text, style = self._buffered_alert_message
                 self._buffered_alert_message = None
                 self.show(text, style)
-
-        def _check_resize(self) -> None:
-            # The log/table/header panels are otherwise only re-rendered by
-            # the periodic tick (~every 0.1s), which briefly leaves a resized
-            # terminal showing content computed for the OLD size -- oversized
-            # or stale for up to one tick. Redraw against the widgets' new
-            # sizes as soon as a resize has actually settled.
-            #
-            # NOT App.on_resize(): the public Resize event fires as soon as
-            # the new terminal size is known, but App._check_resize() (this
-            # method, which we're overriding) is what actually forwards that
-            # event to the Screen -- and only the SCREEN's own resize handler
-            # re-arranges child widgets against the new size. An on_resize
-            # hook (even via call_after_refresh(), which only waits on the
-            # App's own message queue) can and does run before that
-            # screen-level layout has settled, reading logpanel.size.height
-            # still holding the OLD value and defeating the whole point --
-            # confirmed flaky in exactly that way in testing. Overriding this
-            # (private, but stable across the pinned textual==8.2.8) hook
-            # instead means our redraw is scheduled only once Textual's own
-            # resize machinery has done the one thing that actually resizes
-            # widgets, with no fixed guess-timer needed.
-            #
-            # self.screen.call_after_refresh(), not self.call_after_refresh():
-            # _check_resize() posts the actual resize event onto the SCREEN's
-            # own message queue (a separate MessagePump from the App, with its
-            # own independently-scheduled processing), which is what re-
-            # arranges child widgets. Scheduling our callback on the App's
-            # queue instead only waits for the App's OWN pending messages --
-            # an independent race against the Screen's queue that was
-            # confirmed to flake (about 1 in 150 runs) under load.
-            super()._check_resize()
-            if self._mounted:  # can fire before on_mount()'s initial layout
-                self.screen.call_after_refresh(self._redraw_after_resize)
-
-        def _redraw_after_resize(self) -> None:
-            try:
-                self._refresh_widgets()
-            except NoMatches:
-                pass
+                self._toast(text, style)
 
         def _refresh_widgets(self) -> None:
             self.query_one("#header", Static).update(render_header(self.config, self.ui.versions))
             views = self.manager.views()
-            self._populate_table(views)
+            logview = self.query_one("#logview", RichLog)
             if self.ui.combined_logs:
-                lines = self.manager.logs.merged()
+                logview.border_title = "logs · all services (merged)"
             else:
-                lines = self.manager.logs.lines(SERVICE_ORDER[self.ui.selected])
-            logpanel = self.query_one("#logpanel", Static)
-            ever = views[self.ui.selected].ever_started
-            logpanel.update(
-                render_logs(
-                    lines,
-                    combined=self.ui.combined_logs,
-                    timestamps=self.ui.timestamps,
-                    service=SERVICE_ORDER[self.ui.selected],
-                    ever_started=ever,
-                    height=logpanel.size.height,
-                )
-            )
-            self.query_one("#footer", Static).update(render_footer(self.ui, self.clock()))
+                logview.border_title = "logs · " + SERVICE_ORDER[self.ui.selected].capitalize()
+            if self.ui.filter_text:
+                logview.border_subtitle = "/%s/" % self.ui.filter_text
+            else:
+                logview.border_subtitle = ""
+            self._refresh_cards(views)
+            self._refresh_buttons()
+            self._feed_logs()
+            footer = self.query_one("#footer", Static)
+            spinner = next(self._spinner) if self._busy else ""
+            footer.update(render_footer(self.ui, self.clock(), busy_spinner=spinner))
 
-        # -- mouse: DataTable row click selects a service (free bonus, not in
-        # BEHAVIOR.md's hard keyboard contract) -------------------------------
-        #
-        # Textual's DataTable only posts RowSelected when the clicked
-        # coordinate already equals the *current* cursor coordinate -- the
-        # first click on a *different* row just moves the cursor and posts
-        # RowHighlighted instead. Listening to RowHighlighted too (guarded so
-        # it's a no-op when nothing actually changed) is what makes a single
-        # click on any row actually update ui.selected; without it, clicking a
-        # row other than the one already selected silently did nothing.
-        def _expect_cursor_move(self, row: int) -> None:
-            """Register a cursor move WE are about to make, so the next
-            matching RowHighlighted is recognised as our own echo rather than
-            a genuine mouse click (see _populate_table)."""
-            self._expected_row_highlights.append(row)
+        # -- log feeding ------------------------------------------------------
+        def _log_lines(self) -> "list[LogLine]":
+            if self.ui.combined_logs:
+                return self.manager.logs.merged()
+            return self.manager.logs.lines(SERVICE_ORDER[self.ui.selected])
 
-        def _select_row(self, row) -> None:
-            if row is None or not (0 <= row < len(SERVICE_ORDER)):
+        def _render_log_line(self, line: LogLine) -> Text:
+            text = Text()
+            if self.ui.timestamps:
+                text.append(time.strftime("%H:%M:%S ", time.localtime(line.wall)), style="grey50")
+            if self.ui.combined_logs:
+                colour = SERVICE_COLOURS.get(line.service, "white")
+                text.append("[%s] " % line.service, style="bold " + colour)
+                text.append(line.text, style=colour)
+            else:
+                text.append(line.text)
+            return text
+
+        def _feed_logs(self, reset: bool = False) -> None:
+            logview = self.query_one("#logview", RichLog)
+            needle = self.ui.filter_text.lower()
+            if reset:
+                logview.clear()
+                self._last_seq = -1
+                self._log_placeholder = False
+                if not self._log_lines():
+                    self._log_placeholder = True
+                    if self.ui.combined_logs:
+                        logview.write(Text("No output from any service yet.", style="grey50"))
+                    elif not self.manager.views()[self.ui.selected].ever_started:
+                        logview.write(
+                            Text(
+                                "%s has never run. Press Enter on [Start] to launch it."
+                                % SERVICE_ORDER[self.ui.selected].capitalize(),
+                                style="grey50",
+                            )
+                        )
+                    else:
+                        logview.write(Text("(no output yet)", style="grey50"))
+                    return
+                logview.scroll_end(animate=False)
+            for line in self._log_lines():
+                if line.seq <= self._last_seq:
+                    continue
+                self._last_seq = line.seq
+                if needle and needle not in line.text.lower():
+                    continue
+                if self._log_placeholder:
+                    # First real output after a placeholder: drop the note.
+                    logview.clear()
+                    self._log_placeholder = False
+                logview.write(self._render_log_line(line))
+
+        def _reset_log_view(self) -> None:
+            self._feed_logs(reset=True)
+
+        # -- mouse ------------------------------------------------------------
+        def on_service_card_clicked(self, event: "ServiceCard.Clicked") -> None:
+            try:
+                idx = SERVICE_ORDER.index(event.service)
+            except ValueError:
                 return
-            if self._expected_row_highlights and self._expected_row_highlights[0] == row:
-                # Our own periodic-refresh or keyboard-driven cursor move
-                # echoing back, not a click -- consume it and stay quiet.
-                self._expected_row_highlights.popleft()
-                return
-            if row == self.ui.selected:
-                return
-            self.ui.selected = row
-            self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
+            if idx != self.ui.selected:
+                self._select_to(idx)
 
-        def on_data_table_row_highlighted(self, event) -> None:
-            self._select_row(getattr(event, "cursor_row", None))
-
-        def on_data_table_row_selected(self, event) -> None:
-            self._select_row(getattr(event, "cursor_row", None))
+        def on_action_button_triggered(self, event: "ActionButton.Triggered") -> None:
+            self.ui.button = event.index
+            self._refresh_buttons()
+            self._activate(event.index)
 
         # -- key actions ----------------------------------------------------------
-        def _select(self, step: int) -> None:
-            self.ui.selected = (self.ui.selected + step) % len(SERVICE_ORDER)
-            table = self.query_one("#table", DataTable)
-            if table.cursor_coordinate.row != self.ui.selected:
-                self._expect_cursor_move(self.ui.selected)
-            table.move_cursor(row=self.ui.selected)
-            self.show("Selected %s." % SERVICE_ORDER[self.ui.selected].capitalize(), "grey")
+        def _select_to(self, idx: int) -> None:
+            changed = idx != self.ui.selected
+            self.ui.selected = idx
+            if changed:
+                self.show("Selected %s." % SERVICE_ORDER[idx].capitalize(), "grey")
+                self._reset_log_view()
 
         def action_select_prev(self) -> None:
-            self._select(-1)
+            self._select_to((self.ui.selected - 1) % len(SERVICE_ORDER))
 
         def action_select_next(self) -> None:
-            self._select(1)
+            self._select_to((self.ui.selected + 1) % len(SERVICE_ORDER))
 
         def action_button_prev(self) -> None:
             self.ui.button = max(0, self.ui.button - 1)
+            self._refresh_buttons()
 
         def action_button_next(self) -> None:
             self.ui.button = min(len(BUTTONS) - 1, self.ui.button + 1)
+            self._refresh_buttons()
 
         def action_activate(self) -> None:
             self._activate(self.ui.button)
@@ -1656,10 +1750,35 @@ if _HAVE_DEPS:
         def action_toggle_merged(self) -> None:
             self.ui.combined_logs = not self.ui.combined_logs
             self.show("Merged log view %s." % ("on" if self.ui.combined_logs else "off"), "grey")
+            self._reset_log_view()
 
         def action_toggle_timestamps(self) -> None:
             self.ui.timestamps = not self.ui.timestamps
             self.show("Timestamps %s." % ("on" if self.ui.timestamps else "off"), "grey")
+            self._reset_log_view()
+
+        def action_focus_filter(self) -> None:
+            flt = self.query_one("#logfilter", Input)
+            flt.add_class("visible")
+            flt.focus()
+
+        def action_clear_filter(self) -> None:
+            flt = self.query_one("#logfilter", Input)
+            if flt.has_class("visible"):
+                flt.remove_class("visible")
+                if self.ui.filter_text:
+                    self.ui.filter_text = ""
+                    self._reset_log_view()
+                self.show("Log filter cleared.", "grey")
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "logfilter":
+                self.ui.filter_text = event.value.strip()
+                self._reset_log_view()
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id == "logfilter":
+                self.set_focus(None)
 
         def action_show_conn(self) -> None:
             name = SERVICE_ORDER[self.ui.selected]
@@ -1668,11 +1787,15 @@ if _HAVE_DEPS:
                 "Copied %s connection string to clipboard (OSC 52)." % name.capitalize(),
                 "green",
             )
-            self.push_screen(ConnScreen(self.config, self.ui.selected), lambda _r=None: self._flush_pending_alerts())
+            self.push_screen(
+                ConnScreen(self.config, self.ui.selected),
+                lambda _r=None: self._flush_pending_alerts(),
+            )
 
         def action_save_merged(self) -> None:
             _ok, msg, style = self.manager.save_merged_log()
             self.show(msg, style)
+            self._toast(msg, style)
 
         def action_show_help(self) -> None:
             self.push_screen(HelpScreen(), lambda _r=None: self._flush_pending_alerts())
@@ -1686,12 +1809,8 @@ if _HAVE_DEPS:
                 self.exit()  # nothing running: quit quietly
 
         def action_interrupt(self) -> None:
-            # Ctrl+C is a fast alias for 'q', not an unconditional kill: it
-            # goes through the same three-way stop/detach/stay question so a
-            # stray/muscle-memory Ctrl+C can't silently tear down every owned
-            # service with zero confirmation (BEHAVIOR.md's confirmation
-            # contract -- "anything that stops or kills a process asks before
-            # doing it" -- applies here too).
+            # Same three-way question as q: a stray Ctrl+C must never tear
+            # down owned services silently (BEHAVIOR.md confirmation contract).
             if self._busy:
                 return
             if self.manager.any_owned():
@@ -1710,6 +1829,7 @@ if _HAVE_DEPS:
             if btn.action == "start":
                 _ok, msg, style = self.manager.start(name)
                 self.show(msg, style)
+                self._toast(msg, style)
             elif btn.action == "stop":
                 if not self.manager.owns_live(name):
                     _ok, msg, style = self.manager.stop(name)  # grey "not running"
@@ -1724,11 +1844,13 @@ if _HAVE_DEPS:
             elif btn.action == "save":
                 _ok, msg, style = self.manager.save_service_log(name)
                 self.show(msg, style)
+                self._toast(msg, style)
             elif btn.action == "free_port":
                 self._free_port(name)
             elif btn.action == "start_all":
                 msg, style = self._aggregate(self.manager.start_all())
                 self.show(msg, style)
+                self._toast(msg, style)
             elif btn.action == "stop_all":
                 if not self.manager.any_owned():
                     self.show("No services are running.", "grey")
@@ -1759,8 +1881,8 @@ if _HAVE_DEPS:
                     "red",
                 )
                 return
-            # Snapshot which pids are our own children *before* the kill, so the
-            # row can honestly flip to "stopped" if we shoot our own service.
+            # Snapshot which pids are our own children *before* the kill, so
+            # the card can honestly flip to stopped if we shoot our own service.
             owned = {}
             for view in self.manager.views():
                 if view.pid is not None:
@@ -1805,6 +1927,8 @@ if _HAVE_DEPS:
         def _finish_confirmed(self, msg: str, style: str) -> None:
             self._busy = False
             self.show(msg, style)
+            self._toast(msg, style)
+            self._reset_log_view()
 
         def _on_quit_result(self, result: str) -> None:
             self._flush_pending_alerts()
@@ -1821,15 +1945,10 @@ if _HAVE_DEPS:
 
         # -- shutdown, the single choke point every exit path funnels through --
         #
-        # manager.shutdown() -> ServiceManager.stop() calls kill_pid(...) then
-        # proc.wait(timeout=3.0) for every owned service, one at a time -- both
-        # blocking. Running that directly on the app's asyncio thread would
-        # freeze the entire event loop (rendering, input, timers) for up to
-        # ~3s per stuck service. signal.signal() itself must stay on the main
-        # thread (Python raises if it's called off-thread), so _do_shutdown
-        # only masks signals here and hands the actual blocking work to a
-        # worker thread; _finish_shutdown restores the handlers and exits once
-        # that worker reports back via call_from_thread.
+        # manager.shutdown() blocks for up to ~3 s per stuck service; running
+        # that on the asyncio thread would freeze rendering/input. Signal
+        # masking must happen on the main thread, so _do_shutdown masks here
+        # and hands the blocking work to a worker thread.
         def _mask_shutdown_signals(self) -> None:
             self._old_signal_handlers = []
             for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -1853,7 +1972,7 @@ if _HAVE_DEPS:
             if self._shutdown_done:
                 return
             self._shutdown_done = True
-            self._busy = True  # blocks other actions/re-entrant quit prompts until we're done
+            self._busy = True  # blocks other actions/re-entrant quit prompts
             self._mask_shutdown_signals()
             self._shutdown_worker()
 
@@ -1870,16 +1989,9 @@ if _HAVE_DEPS:
             self.exit()
 
         def _install_os_signal_handlers(self) -> None:
-            # NOT signal.signal(): a plain signal.signal()-registered handler
-            # always runs on the process's one main thread, which is also the
-            # thread running this app's asyncio loop -- so call_from_thread()
-            # from inside it would (and did) always raise "must run in a
-            # different thread from the app". loop.add_signal_handler runs its
-            # callback as an ordinary loop callback instead of inside a raw
-            # OS-signal stack frame, so no thread hop is needed at all: call
-            # _shutdown_from_signal directly. NotImplementedError (Windows) or
-            # RuntimeError (no running loop yet) just leaves that signal
-            # unhandled by us, same as before.
+            # loop.add_signal_handler runs its callback as an ordinary loop
+            # callback (no thread hop needed); NotImplementedError on Windows
+            # just leaves the signal unhandled by us, same as before.
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
