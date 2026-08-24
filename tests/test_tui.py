@@ -1215,24 +1215,46 @@ async def test_modal_suppresses_bell_and_message_then_flushes_on_dismiss():
 # --- sparkline activity buckets --------------------------------------------------------------
 
 
-async def test_cards_render_an_activity_sparkline_after_traffic():
+def test_spark_bucketing_counts_by_sequence_surviving_ring_wraparound():
+    """Buckets are tracked by global sequence number, not buffer length, so
+    the graph keeps working once the per-service ring buffer is full and
+    silently stops growing."""
+    manager = FakeManager()
+    manager.logs = azctl.LogStore(capacity=4)  # tiny ring: wraps almost immediately
+    app = azctl.AzctlApp(azctl.Config(), manager)
+
+    for i in range(6):
+        manager.logs.append("blob", "warm %d" % i)
+    app._update_spark()
+    # Only the 4 survivors of the wrap are countable -- the point is that
+    # counting keeps WORKING after the buffer is full.
+    assert app._spark["blob"][-1] == 4
+
+    manager.logs.append("blob", "after wrap A")
+    manager.logs.append("blob", "after wrap B")
+    app._update_spark()
+    assert app._spark["blob"][-1] == 2, (
+        "post-wrap arrivals must still be counted"
+    )
+    # A quiet refresh contributes a zero bucket, not a repeat count.
+    app._update_spark()
+    assert list(app._spark["blob"])[-2:] == [2, 0]
+
+
+async def test_cards_render_an_activity_sparkline_when_buckets_have_data():
     manager = FakeManager()
     app = azctl.AzctlApp(azctl.Config(), manager)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        for i in range(5):
-            manager.logs.append("queue", "tick %d" % i)
-        # Drive the bucketing deterministically instead of waiting out the
-        # real 0.1s tick / 3-beat refresh gate (slow-CI flake avoidance).
-        app._update_spark()
+        # Seed buckets directly: the ambient refresh worker would otherwise
+        # race the test's own bucketing on slow CI machines.
+        app._spark["queue"].clear()
+        app._spark["queue"].extend((0, 1, 7, 2))
+        app._refresh_widgets()
         await pilot.pause()
-        # The freshest bucket holds all five lines; earlier buckets may hold
-        # zeroes from ambient ticks that ran before the traffic arrived.
-        assert app._spark["queue"][-1] == 5, app._spark["queue"]
-        app._refresh_widgets()  # cards redraw on the tick; force it here
         out = card_text(app, "queue", width=80)
         assert any(ch in out for ch in azctl.SPARK_BLOCKS), (
-            "expected sparkline blocks on the card after fresh traffic"
+            "expected sparkline blocks on the card once buckets hold data"
         )
 
 
