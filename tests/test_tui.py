@@ -1222,7 +1222,14 @@ async def test_cards_render_an_activity_sparkline_after_traffic():
         await pilot.pause()
         for i in range(5):
             manager.logs.append("queue", "tick %d" % i)
-        await pilot.pause(1.5)  # let several refresh ticks bucket the traffic
+        # Drive the bucketing deterministically instead of waiting out the
+        # real 0.1s tick / 3-beat refresh gate (slow-CI flake avoidance).
+        app._update_spark()
+        await pilot.pause()
+        # The freshest bucket holds all five lines; earlier buckets may hold
+        # zeroes from ambient ticks that ran before the traffic arrived.
+        assert app._spark["queue"][-1] == 5, app._spark["queue"]
+        app._refresh_widgets()  # cards redraw on the tick; force it here
         out = card_text(app, "queue", width=80)
         assert any(ch in out for ch in azctl.SPARK_BLOCKS), (
             "expected sparkline blocks on the card after fresh traffic"

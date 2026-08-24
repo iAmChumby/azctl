@@ -1554,7 +1554,9 @@ if _HAVE_DEPS:
                     card.add_class("selected")
 
         def _refresh_buttons(self) -> None:
-            for i, widget in enumerate(self.query(ActionButton)):
+            # Scoped to #btnrow: modal screens (quit dialog, conn-string
+            # copies) reuse ActionButton and must never pick up hot styling.
+            for i, widget in enumerate(self.query("#btnrow ActionButton")):
                 widget.update(btn_label(widget.btn, hot=(i == self.ui.button)))
 
         def _update_spark(self) -> None:
