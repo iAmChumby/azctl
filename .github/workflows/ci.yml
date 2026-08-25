@@ -28,8 +28,10 @@ jobs:
             echo "pwsh not available on this runner; skipped"
           fi
       - name: Ruff
+        # Pinned: new ruff releases have flipped default rule sets before,
+        # and an unpinned lint tool fails CI the day that happens.
         run: |
-          pip install ruff
+          pip install ruff==0.15.22
           ruff check azctl.py tests/
 
   test:

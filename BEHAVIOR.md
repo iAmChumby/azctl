@@ -174,7 +174,7 @@ letters that fire immediately. You move a highlight to what you want and then
 press Enter. Nothing disruptive can happen from a stray keystroke.
 
 **Up and down arrows** choose which service you are working with. The chosen one
-is marked in the table, and the log panel switches to it. Switching is instant.
+is marked on its card, and the log panel switches to it. Switching is instant.
 
 **Left and right arrows** move along the action bar at the bottom. The
 highlighted one is reversed. Buttons that stop or kill something are printed in
