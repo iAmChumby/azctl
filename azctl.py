@@ -1507,6 +1507,15 @@ if _HAVE_DEPS:
         def show(self, text: str, style: str) -> None:
             self.ui.message = (text, style, self.clock() + MESSAGE_TTL)
 
+        def _safe_refresh(self) -> None:
+            """Render immediately instead of waiting up to a tick (0.1 s) —
+            state-changing actions must be visible the moment they run, and
+            tick-timed redraws alone leave a visible input lag."""
+            try:
+                self._refresh_widgets()
+            except NoMatches:
+                pass
+
         @staticmethod
         def _aggregate(results) -> "tuple[str, str]":
             rank = {"grey": 0, "green": 1, "yellow": 2, "red": 3}
@@ -1741,6 +1750,7 @@ if _HAVE_DEPS:
             if changed:
                 self.show("Selected %s." % SERVICE_ORDER[idx].capitalize(), "grey")
                 self._reset_log_view()
+                self._safe_refresh()
 
         def action_select_prev(self) -> None:
             self._select_to((self.ui.selected - 1) % len(SERVICE_ORDER))
@@ -1763,11 +1773,13 @@ if _HAVE_DEPS:
             self.ui.combined_logs = not self.ui.combined_logs
             self.show("Merged log view %s." % ("on" if self.ui.combined_logs else "off"), "grey")
             self._reset_log_view()
+            self._safe_refresh()
 
         def action_toggle_timestamps(self) -> None:
             self.ui.timestamps = not self.ui.timestamps
             self.show("Timestamps %s." % ("on" if self.ui.timestamps else "off"), "grey")
             self._reset_log_view()
+            self._safe_refresh()
 
         def action_focus_filter(self) -> None:
             flt = self.query_one("#logfilter", Input)
@@ -1781,12 +1793,14 @@ if _HAVE_DEPS:
                 if self.ui.filter_text:
                     self.ui.filter_text = ""
                     self._reset_log_view()
+                    self._safe_refresh()
                 self.show("Log filter cleared.", "grey")
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "logfilter":
                 self.ui.filter_text = event.value.strip()
                 self._reset_log_view()
+                self._safe_refresh()
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
             if event.input.id == "logfilter":
