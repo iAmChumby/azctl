@@ -36,6 +36,27 @@ git clone https://github.com/iAmChumby/azctl && cd azctl
 python3 azctl.py
 ```
 
+## Install as a command
+
+Installs `azctl` as a proper command on your PATH (the app still self-bootstraps its deps into its own private venv; nothing else is touched):
+
+**macOS / Linux / WSL** (installs to `~/.local/bin/azctl`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iAmChumby/azctl/main/install.sh | sh
+```
+
+or from a checkout: `./install.sh` (optionally pass a tag/branch to pin).
+
+**Windows PowerShell** (installs to `%LOCALAPPDATA%\azctl\bin`, adds it to your user PATH, creates an `azctl.cmd` shim):
+
+```powershell
+irm https://raw.githubusercontent.com/iAmChumby/azctl/main/install.ps1 -OutFile install.ps1
+.\install.ps1
+```
+
+Both scripts accept a ref argument (`./install.sh v1.2.3`) to pin a version instead of following the default branch.
+
 Azurite itself installs with `npm install -g azurite`. If it's missing, `azctl` tells you exactly that instead of failing cryptically.
 
 ## The four ways to use it

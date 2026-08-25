@@ -16,6 +16,17 @@ jobs:
           python-version: "3.12"
       - name: Byte-compile
         run: python -m py_compile azctl.py
+      - name: Installer syntax (sh)
+        run: sh -n install.sh
+      - name: Installer syntax (PowerShell)
+        # GitHub-hosted ubuntu runners ship pwsh; if that ever changes, skip
+        # rather than fail -- sh -n above already covers the other installer.
+        run: |
+          if command -v pwsh >/dev/null; then
+            pwsh -NoProfile -Command "\$e = \$null; [void][System.Management.Automation.Language.Parser]::ParseFile('install.ps1', [ref]\$null, [ref]\$e); \$e | ForEach-Object { \$_.Message }; exit ([bool]\$e)"
+          else
+            echo "pwsh not available on this runner; skipped"
+          fi
       - name: Ruff
         run: |
           pip install ruff
