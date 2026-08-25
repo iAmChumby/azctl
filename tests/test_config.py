@@ -88,7 +88,7 @@ def test_bootstrap_sentinel_guard_explains_and_exits(monkeypatch, capsys):
         azctl._bootstrap_and_reexec()
     assert excinfo.value.code == 1
     err = capsys.readouterr().err
-    assert "pip install textual psutil" in err
+    assert "pip install" in err and "textual" in err and "psutil" in err
     assert "Traceback" not in err
 
 

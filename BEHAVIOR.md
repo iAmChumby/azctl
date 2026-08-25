@@ -101,28 +101,43 @@ such as a code editor extension, and you need to stop it at the source.
 Four regions, top to bottom.
 
 **The header** names the application and shows where the services are bound and
-where the data lives. This is the "am I looking at the right thing" line.
+where the data lives, along with the Azurite and Node versions actually in use.
+This is the "am I looking at the right thing" line.
 
-**The status table** has one row per service and five columns:
+**The status cards** have one card per service, side by side. Each card shows:
 
-| Column | What it tells you |
+| Element | What it tells you |
 |---|---|
-| Service | Blob, Queue, or Table. The selected one is marked. |
-| Status | One of five states, described below. |
-| Port | Which port this service is using. |
-| PID | The process ID, or a dash when nothing is running. |
-| Uptime | How long it has been up, in hours, minutes, seconds. |
+| State line | One of five states, described below, as a symbol plus word. |
+| Name and port | Blob, Queue, or Table, and which port it uses. |
+| PID and uptime | The process ID and how long it has been up — or its exit code if it died. |
+| Activity sparkline | A miniature graph of that service's recent log traffic, so a busy or silent service reads at a glance. |
 
-**The log panel** shows the recent output of whichever service is selected. It
-always shows the newest lines, and it grows or shrinks to fill whatever space
-the terminal has. Making the window taller shows more history. Long lines are
-cut off at the edge rather than wrapping, so one noisy line never eats three
-rows.
+A selected service's card is marked with an arrow, drawn brighter, and given a
+heavier border in the state colour. A card whose service is still starting
+gently pulses so you can see at a glance that something is in flight. Clicking
+a card selects it.
+
+**The log panel** shows the recent output of whichever service is selected,
+with the service named on the panel's border. It always shows the newest lines,
+and it grows or shrinks to fill whatever space the terminal has. Making the
+window taller shows more history. Long lines are cut off at the edge rather
+than wrapping, so one noisy line never eats three rows.
+
+Pressing `/` opens a filter bar under the panel: as you type, only lines
+containing the text remain visible, and the active filter shows on the panel's
+border and in the footer until Esc clears it.
 
 If a service has never run, the panel says so and tells you what to press.
 
-**The footer** holds the status legend, the action bar, the navigation hints,
-and a message line where the application tells you what just happened.
+**The footer** holds the status legend, the navigation hints, and a message
+line where the application tells you what just happened. Between the log panel
+and the footer sits **the action bar**: one labelled entry per action, the
+dangerous ones printed in red, the highlighted one reversed so you can always
+see what Enter will do. Actions can be clicked as well as highlighted.
+
+While a confirmed action is still running, the message line shows a spinner so
+it is obvious the application has not frozen.
 
 ---
 
@@ -159,10 +174,10 @@ letters that fire immediately. You move a highlight to what you want and then
 press Enter. Nothing disruptive can happen from a stray keystroke.
 
 **Up and down arrows** choose which service you are working with. The chosen one
-is marked in the table, and the log panel switches to it. Switching is instant.
+is marked on its card, and the log panel switches to it. Switching is instant.
 
-**Left and right arrows** move along a row of named buttons at the bottom. The
-highlighted one is boxed. Buttons that stop or kill something are printed in
+**Left and right arrows** move along the action bar at the bottom. The
+highlighted one is reversed. Buttons that stop or kill something are printed in
 red, so you can see the dangerous ones before you land on them.
 
 **Enter** runs whatever is highlighted.
@@ -187,9 +202,9 @@ everything rather than on the one service you have selected.
 ## The confirmation behavior
 
 Anything that stops or kills a process asks before doing it. The question
-appears in the footer, in plain words, naming the exact thing about to happen
-("Stop Blob?"). Enter confirms. Escape, or any other key, cancels and says
-"Cancelled."
+appears docked at the bottom of the screen, in the footer's place, in plain
+words, naming the exact thing about to happen ("Stop Blob?"). Enter confirms.
+Escape, or any other key, cancels and says "Cancelled."
 
 The Free port confirmation goes further. Before it kills anything it looks up
 what is actually on that port and names it in the question: the process name and
@@ -243,6 +258,8 @@ button worked.
 When something happens, a short message appears at the bottom. Green when it
 worked, red when it failed, yellow for "it worked but you should know
 something," grey for routine notes like which service you just selected.
+Significant results also surface as a transient toast in the corner of the
+screen, so a success or failure is hard to miss even if you were mid-keystroke.
 
 Messages fade after a few seconds so the footer does not accumulate stale text.
 
@@ -252,13 +269,17 @@ Messages fade after a few seconds so the footer does not accumulate stale text.
 
 Pressing `q` quits, but only quietly if there is nothing running.
 
-If services are still up, it stops and asks a three-way question, because there
-are genuinely two reasonable answers:
+If services are still up, it stops and asks a three-way question in a centred
+dialog, because there are genuinely two reasonable answers:
 
-- **Enter**: stop the services and exit. For when you are done for the day.
-- **n**: leave the services running and exit. For when you just wanted the
-  dashboard out of the way but your app still needs Azurite up.
-- **Escape**: never mind, stay in the dashboard.
+- **Enter** (or the "Stop & quit" choice): stop the services and exit. For when
+  you are done for the day.
+- **n** (or "Leave running"): leave the services running and exit. For when you
+  just wanted the dashboard out of the way but your app still needs Azurite up.
+- **Escape** (or "Stay"): never mind, stay in the dashboard.
+
+Every other key is ignored while the question is open — there are exactly three
+answers, and a stray keystroke must not pick one for you.
 
 This matters because the dashboard is the owner of those services while it is
 open. If it closed without asking, a developer would lose their running emulator

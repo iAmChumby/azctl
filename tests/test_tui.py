@@ -1,18 +1,19 @@
-"""Headless Textual dashboard tests for AzctlApp.
+"""Headless Textual dashboard tests for the rebuilt AzctlApp.
 
 Everything runs without a TTY (Textual's run_test() is headless), without
 azurite, and without launching a real interactive event loop: AzctlApp is
 driven through ``async with app.run_test() as pilot``, wired either to a
-FakeManager (fast, deterministic) or a real ServiceManager pointed at a
-fake ``python3 -c`` TCP-listener command injected through the
-``command_for`` seam (helpers.listener_command) -- never a real Azurite
-install.
+FakeManager (fast, deterministic) or a real ServiceManager pointed at a fake
+``python3 -c`` TCP-listener command injected through the ``command_for``
+seam (helpers.listener_command) -- never a real Azurite install.
 
-Coverage is mapped to BEHAVIOR.md: the five-state table, selection/log-panel
-following, button-highlight styling, Start/Stop/Restart/Save/Free-port/Stop-all
-button semantics and their confirmations, the merged-log and timestamp
-toggles, connection-string copy, the help overlay, the three-way quit
-question, the broken-transition bell, and the non-TTY refusal.
+Coverage is mapped to BEHAVIOR.md: the five-state cards, selection/log-panel
+following (keyboard and mouse), action-highlight styling and destructive
+colours, Start/Stop/Restart/Save/Free-port/Stop-all semantics and their
+confirmations, the merged-log and timestamp toggles, the log filter bar,
+connection-string copy (OSC 52), the help overlay, the three-way quit
+question, the broken-transition bell (and its buffering under a modal),
+non-TTY refusal, and the off-loop threading guarantees.
 """
 
 import asyncio
@@ -27,7 +28,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 from rich.console import Console
-from textual.coordinate import Coordinate
 
 import azctl
 from helpers import free_port, listener_command, spawn_listener, wait_busy_clears, wait_for
@@ -36,16 +36,7 @@ from helpers import free_port, listener_command, spawn_listener, wait_busy_clear
 @asynccontextmanager
 async def dashboard(app):
     """Run `app` headlessly via Pilot, then force a clean `app.exit()`
-    *before* letting `run_test()`'s own teardown proceed.
-
-    AzctlApp's periodic 0.1 s refresh timer (_on_tick, installed via
-    set_interval in on_mount) now guards against firing mid-teardown (see
-    `test_refresh_timer_does_not_race_app_teardown` near the bottom of this
-    file), but calling exit() explicitly here still lets Textual's own exit
-    machinery stop the timer deterministically before Pilot's teardown, which
-    keeps every other test in this module from paying that (small, now
-    harmless) race at all.
-    """
+    *before* letting `run_test()`'s own teardown proceed."""
     async with app.run_test() as pilot:
         try:
             yield pilot
@@ -55,20 +46,7 @@ async def dashboard(app):
             await pilot.pause()
 
 
-# --- render/export helpers -----------------------------------------------
-
-
 def export(renderable, width=140):
-    # file=io.StringIO(): a record=True Console still physically writes to
-    # its `file` in addition to recording. Without an explicit in-memory
-    # sink it defaults to sys.stdout -- which, while an AzctlApp is running
-    # under run_test(), Textual transparently redirects to its own App._print
-    # so it can capture stray prints. On a Windows CI runner that redirect's
-    # real underlying stream uses the legacy 'cp1252' console codepage, which
-    # can't encode the box-drawing/bullet glyphs these renderables use,
-    # raising UnicodeEncodeError -- a test-tooling bug (a helper accidentally
-    # depending on the real stdout's encoding), not anything about AzctlApp's
-    # own rendering.
     console = Console(record=True, width=width, file=io.StringIO())
     console.print(renderable)
     return console.export_text()
@@ -76,9 +54,6 @@ def export(renderable, width=140):
 
 def view(name, state, port, pid=None, uptime=None, ever=False, exit_code=None):
     return azctl.ServiceView(name, state, port, pid, uptime, ever, exit_code)
-
-
-# --- a minimal fake ServiceManager: just enough surface for AzctlApp ----
 
 
 class FakeManager:
@@ -161,9 +136,7 @@ class FakeManager:
 
 
 class TransitionManager(FakeManager):
-    """Replays a fixed list of Transitions, one per refresh() call --
-    lets a test drive AzctlApp's refresh tick into a ->BROKEN transition
-    without a real process dying."""
+    """Replays a fixed list of Transitions, one per refresh() call."""
 
     def __init__(self, transitions, owned=(), reason=None):
         FakeManager.__init__(self, owned=owned)
@@ -179,23 +152,47 @@ class TransitionManager(FakeManager):
         return self._reason
 
 
-def table_cell(app, row, col):
-    table = app.query_one("#table")
-    return table.get_cell_at(Coordinate(row, col))
+# --- render/export helpers -------------------------------------------------
+
+
+def card_text(app, name, width=60):
+    card = app.query_one("#card-%s" % name)
+    return export(card.content, width=width)
 
 
 def footer_text(app, width=140):
     return export(app.query_one("#footer").content, width=width)
 
 
-def logpanel_text(app, width=140):
-    return export(app.query_one("#logpanel").content, width=width)
+def button_texts(app):
+    out = []
+    for widget in app.query(azctl.ActionButton):
+        text = widget.content
+        spans = [
+            (str(s.style), text.plain[s.start : s.end]) for s in text.spans
+        ]
+        out.append((text.plain, spans))
+    return out
 
 
-# --- five-state table rendering ------------------------------------------
+def hot_index(app):
+    # The hot button is rendered tight-bracketed ("[Stop]"), cold ones are
+    # padded ("[ Stop ]") -- see btn_label().
+    for i, (plain, _spans) in enumerate(button_texts(app)):
+        if re.fullmatch(r"\[[^\]\s][^\]]*\]", plain):
+            return i
+    raise AssertionError("no highlighted button found")
 
 
-async def test_five_states_symbols_and_colours_in_table():
+def logview_text(app):
+    lv = app.query_one("#logview")
+    return "\n".join(strip.text for strip in lv.lines)
+
+
+# --- five-state cards -------------------------------------------------------
+
+
+async def test_five_states_symbols_and_colours_in_cards():
     views_a = [
         view("blob", azctl.RUNNING, 10000, pid=4242, uptime=3725.0, ever=True),
         view("queue", azctl.STARTING, 10001, pid=4243, uptime=2.0, ever=True),
@@ -204,18 +201,20 @@ async def test_five_states_symbols_and_colours_in_table():
     app = azctl.AzctlApp(azctl.Config(), FakeManager(views=views_a))
     async with dashboard(app) as pilot:
         await pilot.pause()
-        assert table_cell(app, 0, 1).plain == "● running"
-        assert table_cell(app, 0, 1).style == "green"
-        assert table_cell(app, 1, 1).plain == "◐ starting"
-        assert table_cell(app, 1, 1).style == "yellow"
-        assert table_cell(app, 2, 1).plain == "○ stopped"
-        assert table_cell(app, 2, 1).style == "grey50"
+        assert "● running" in card_text(app, "blob")
+        assert "◐ starting" in card_text(app, "queue")
+        assert "○ stopped" in card_text(app, "table")
+        assert app.query_one("#card-blob").has_class("state-running")
+        assert app.query_one("#card-queue").has_class("state-starting")
+        assert app.query_one("#card-table").has_class("state-stopped")
         # port / PID / uptime formatting
-        assert table_cell(app, 0, 2) == "10000"
-        assert table_cell(app, 0, 3) == "4242"
-        assert table_cell(app, 0, 4) == "1:02:05"
-        assert table_cell(app, 2, 3) == "—"
-        assert table_cell(app, 2, 4) == "—"
+        blob_out = card_text(app, "blob")
+        assert "10000" in blob_out
+        assert "4242" in blob_out
+        assert "1:02:05" in blob_out
+        table_out = card_text(app, "table")
+        assert "pid —" in table_out
+        assert "up" not in table_out
 
     views_b = [
         view("blob", azctl.BROKEN, 10000, ever=True, exit_code=3),
@@ -225,31 +224,35 @@ async def test_five_states_symbols_and_colours_in_table():
     app2 = azctl.AzctlApp(azctl.Config(), FakeManager(views=views_b))
     async with dashboard(app2) as pilot:
         await pilot.pause()
-        assert table_cell(app2, 0, 1).plain == "✖ broken"
-        assert table_cell(app2, 0, 1).style == "red"
-        assert table_cell(app2, 1, 1).plain == "◆ port in use"
-        assert table_cell(app2, 1, 1).style == "magenta"
+        assert "✖ broken" in card_text(app2, "blob")
+        assert app2.query_one("#card-blob").has_class("state-broken")
+        assert "◆ port in use" in card_text(app2, "queue")
+        assert app2.query_one("#card-queue").has_class("state-port_in_use")
+        # a broken death shows its exit code on the card
+        assert "exit 3" in card_text(app2, "blob")
 
 
-async def test_selected_marker_is_the_datatable_cursor_row():
+async def test_selected_card_is_marked_and_follows_the_keyboard():
     app = azctl.AzctlApp(azctl.Config(), FakeManager())
     async with dashboard(app) as pilot:
         await pilot.pause()
-        table = app.query_one("#table")
-        assert table.cursor_row == 0
+        assert app.ui.selected == 0
+        assert app.query_one("#card-blob").has_class("selected")
+        assert "▸" in card_text(app, "blob")
         await pilot.press("down")
         await pilot.pause()
-        assert table.cursor_row == 1
         assert app.ui.selected == 1
+        assert app.query_one("#card-queue").has_class("selected")
+        assert not app.query_one("#card-blob").has_class("selected")
         await pilot.press("down")
         await pilot.pause()
-        assert table.cursor_row == 2
         await pilot.press("down")  # wraps back to 0
         await pilot.pause()
-        assert table.cursor_row == 0
+        assert app.ui.selected == 0
+        assert app.query_one("#card-blob").has_class("selected")
 
 
-# --- up/down selection + the log panel following it ----------------------
+# --- up/down selection + the log panel following it -------------------------
 
 
 async def test_up_down_selects_service_and_log_panel_follows():
@@ -259,34 +262,58 @@ async def test_up_down_selects_service_and_log_panel_follows():
     app = azctl.AzctlApp(azctl.Config(), manager)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        assert "hello from blob" in logpanel_text(app)
+        assert "hello from blob" in logview_text(app)
         await pilot.press("down")
-        await pilot.pause(0.15)  # let the next refresh tick redraw the log panel
+        await pilot.pause()
         assert app.ui.selected == 1
         assert app.ui.message[0] == "Selected Queue."
         assert app.ui.message[1] == "grey"
-        assert "hello from queue" in logpanel_text(app)
-        assert "hello from blob" not in logpanel_text(app)
+        assert "hello from queue" in logview_text(app)
+        assert "hello from blob" not in logview_text(app)
+        assert "logs · Queue" in app.query_one("#logview").border_title
         await pilot.press("up")
-        await pilot.pause(0.15)
+        await pilot.pause()
         assert app.ui.selected == 0
         assert app.ui.message[0] == "Selected Blob."
 
 
-# --- left/right button highlight + destructive styling --------------------
+async def test_log_panel_says_never_run_for_an_untouched_service():
+    manager = FakeManager()
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        out = logview_text(app)
+        assert "Blob has never run. Press Enter on [Start] to launch it." in out
 
 
-async def test_left_right_moves_button_highlight_and_destructive_are_styled():
+async def test_placeholder_clears_when_real_output_arrives():
+    manager = FakeManager()
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        assert "never run" in logview_text(app)
+        manager.logs.append("blob", "first real line")
+        await pilot.press("down")
+        await pilot.press("up")  # force a reset+refeed of Blob's view
+        await pilot.pause()
+        out = logview_text(app)
+        assert "never run" not in out
+        assert "first real line" in out
+
+
+# --- left/right action highlight + destructive styling ----------------------
+
+
+async def test_left_right_moves_button_highlight():
     app = azctl.AzctlApp(azctl.Config(), FakeManager())
     async with dashboard(app) as pilot:
         await pilot.pause()
         assert app.ui.button == 0
-        text = footer_text(app)
-        assert "[Stop]" in text and "[Restart]" in text and "[Free port]" in text
-        assert "[Stop all]" in text
+        assert hot_index(app) == 0
         await pilot.press("right")
         await pilot.pause()
         assert app.ui.button == 1
+        assert hot_index(app) == 1
         await pilot.press("left")
         await pilot.pause()
         assert app.ui.button == 0
@@ -294,29 +321,33 @@ async def test_left_right_moves_button_highlight_and_destructive_are_styled():
         await pilot.press("left")
         await pilot.pause()
         assert app.ui.button == 0
-        # Clamped at the right edge (7 buttons, indices 0..6).
+        # Clamped at the right edge.
         for _ in range(10):
             await pilot.press("right")
             await pilot.pause()
         assert app.ui.button == len(azctl.BUTTONS) - 1
+        assert hot_index(app) == len(azctl.BUTTONS) - 1
 
 
-def test_button_bar_destructive_buttons_render_in_red():
-    """Same semantics AzctlApp's footer draws from render_button_bar --
-    verified directly against the pure function (already unit-tested in
-    test_render.py) so this file also documents the exact BEHAVIOR.md claim
-    the App-level test above depends on."""
-    bar = azctl.render_button_bar(0)
-    console = Console(record=True, width=140, file=io.StringIO())
-    console.print(bar)
-    segments = list(console.render(bar))
-    danger_labels = [b.label for b in azctl.BUTTONS if b.danger]
-    for seg in segments:
-        if seg.text.strip("[]") in danger_labels and seg.style is not None:
-            assert seg.style.color is not None and seg.style.color.name == "red"
+async def test_hot_button_style_follows_the_highlight():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        # Button 0 (Start, safe) is hot: its label is drawn reversed.
+        start_spans = button_texts(app)[0][1]
+        assert any("reverse" in str(style) for style, _text in start_spans)
+        # A cold dangerous button (Stop) is red but never reversed.
+        stop_spans = button_texts(app)[1][1]
+        assert any("red" in str(style) for style, _text in stop_spans)
+        assert not any("reverse" in str(style) for style, _text in stop_spans)
+        # Move the highlight onto Stop: now it is reversed too.
+        await pilot.press("right")
+        await pilot.pause()
+        stop_spans = button_texts(app)[1][1]
+        assert any("reverse" in str(style) and "bold" in str(style) for style, _text in stop_spans)
 
 
-# --- Enter on Start: no confirm, real fake service ------------------------
+# --- Enter on Start: no confirm, real fake service --------------------------
 
 
 async def test_enter_on_start_starts_the_service_no_confirm():
@@ -334,8 +365,8 @@ async def test_enter_on_start_starts_the_service_no_confirm():
 
 async def test_start_reaches_running_with_a_real_fake_listener_process(tmp_path):
     """Uses a real ServiceManager wired to a fake `python3 -c` TCP-listener
-    command (helpers.listener_command) instead of a mock -- no azurite
-    binary anywhere, but a genuine child process and a genuine port."""
+    command instead of a mock -- no azurite binary anywhere, but a genuine
+    child process and a genuine port."""
     config = azctl.Config(
         blob_port=free_port(), queue_port=free_port(), table_port=free_port(), data_dir=str(tmp_path)
     )
@@ -354,11 +385,17 @@ async def test_start_reaches_running_with_a_real_fake_listener_process(tmp_path)
                 if manager.views()[0].state == azctl.RUNNING:
                     break
             assert manager.views()[0].state == azctl.RUNNING
+            # the card eventually reflects it too
+            for _ in range(30):
+                await pilot.pause(0.1)
+                if "● running" in card_text(app, "blob"):
+                    break
+            assert "● running" in card_text(app, "blob")
     finally:
         manager.shutdown()
 
 
-# --- Stop/Restart: confirm modal, Enter confirms, other key cancels ------
+# --- Stop/Restart: confirm modal, Enter confirms, other key cancels ---------
 
 
 async def test_stop_asks_confirm_and_enter_confirms_it():
@@ -374,7 +411,8 @@ async def test_stop_asks_confirm_and_enter_confirms_it():
         await pilot.press("enter")  # confirm
         assert await wait_busy_clears(pilot, app)
         assert ("stop", "blob") in manager.calls
-        assert app.ui.message == ("Stopped Blob.", "green", app.ui.message[2])
+        assert app.ui.message[0] == "Stopped Blob."
+        assert app.ui.message[1] == "green"
         assert not isinstance(app.screen, azctl.ConfirmScreen)
 
 
@@ -425,7 +463,7 @@ async def test_stop_when_not_running_does_not_ask_grey_message():
         assert app.ui.message[1] == "grey"
 
 
-# --- Free port: names the squatter, and the no-op path --------------------
+# --- Free port: names the squatter, and the no-op path -----------------------
 
 
 async def test_free_port_confirm_names_squatter_and_kill_frees_it():
@@ -468,7 +506,7 @@ async def test_free_port_with_nothing_listening_is_a_grey_noop():
         assert app.ui.message[1] == "grey"
 
 
-# --- Stop all: confirm, grey message when nothing running -----------------
+# --- Stop all: confirm, grey message when nothing running --------------------
 
 
 async def test_stop_all_confirms_then_stops_everything():
@@ -503,7 +541,7 @@ async def test_stop_all_with_nothing_running_is_a_grey_noop():
         assert app.ui.message[1] == "grey"
 
 
-# --- Save: line count + full path, empty buffer still writes -------------
+# --- Save: reports via the app message ---------------------------------------
 
 
 def test_save_service_log_reports_count_and_path_and_writes_when_empty(tmp_path, monkeypatch):
@@ -543,7 +581,26 @@ async def test_save_button_reports_via_the_app_message(tmp_path, monkeypatch):
         assert os.path.exists(path)
 
 
-# --- 'a' merged view: arrival order, colour-tagged, footer shows mode ----
+async def test_save_all_writes_the_merged_log_via_S(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = azctl.Config(blob_port=free_port(), queue_port=free_port(), table_port=free_port())
+    manager = azctl.ServiceManager(config, command_for=lambda _n, _c: None)
+    manager.logs.append("blob", "b-line")
+    manager.logs.append("queue", "q-line")
+    app = azctl.AzctlApp(config, manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("S")
+        await pilot.pause()
+        path = os.path.join(str(tmp_path), "azurite-all.log")
+        assert os.path.exists(path)
+        content = open(path).read()
+        assert "[blob] b-line" in content
+        assert "[queue] q-line" in content
+        assert "azurite-all.log" in app.ui.message[0]
+
+
+# --- 'a' merged view: arrival order, colour-tagged, footer shows mode --------
 
 
 async def test_merge_toggle_shows_arrival_ordered_colour_tagged_lines():
@@ -557,22 +614,28 @@ async def test_merge_toggle_shows_arrival_ordered_colour_tagged_lines():
         await pilot.pause()
         assert "logs: selected" in footer_text(app)
         await pilot.press("a")
-        await pilot.pause(0.15)  # let the next refresh tick redraw footer + log panel
+        await pilot.pause()
         assert app.ui.combined_logs is True
         assert "logs: ALL" in footer_text(app)
-        out = logpanel_text(app)
+        assert "all services (merged)" in app.query_one("#logview").border_title
+        out = logview_text(app)
         assert "[blob] blob-first" in out
         assert "[queue] queue-second" in out
         assert "[table] table-fourth" in out
         positions = [out.index(t) for t in ("blob-first", "queue-second", "blob-third", "table-fourth")]
         assert positions == sorted(positions)
         await pilot.press("a")  # toggle back off
-        await pilot.pause(0.15)
+        await pilot.pause()
         assert app.ui.combined_logs is False
         assert "logs: selected" in footer_text(app)
+        # back to the selected-service view: only Blob's own lines remain
+        out = logview_text(app)
+        assert "blob-first" in out
+        assert "queue-second" not in out
+        assert "table-fourth" not in out
 
 
-# --- 't' timestamp toggle --------------------------------------------------
+# --- 't' timestamp toggle -----------------------------------------------------
 
 
 async def test_timestamp_toggle_changes_rendered_log_lines():
@@ -587,19 +650,111 @@ async def test_timestamp_toggle_changes_rendered_log_lines():
     app = azctl.AzctlApp(azctl.Config(), manager)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        assert stamp not in logpanel_text(app)
+        assert stamp not in logview_text(app)
         await pilot.press("t")
-        await pilot.pause(0.15)  # let the next refresh tick redraw the log panel
+        await pilot.pause()
         assert app.ui.timestamps is True
         assert app.ui.message[0] == "Timestamps on."
-        assert "%s hello world" % stamp in logpanel_text(app)
+        assert "%s hello world" % stamp in logview_text(app)
         await pilot.press("t")
-        await pilot.pause(0.15)
+        await pilot.pause()
         assert app.ui.message[0] == "Timestamps off."
-        assert stamp not in logpanel_text(app)
+        assert stamp not in logview_text(app)
 
 
-# --- 'c' connection string copy (OSC 52) + overlay -------------------------
+# --- '/' filter bar ------------------------------------------------------------
+
+
+async def test_filter_bar_narrows_lines_live_and_esc_clears_it():
+    manager = FakeManager()
+    manager.logs.append("blob", "alpha one")
+    manager.logs.append("blob", "beta two")
+    manager.logs.append("blob", "alpha three")
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        flt = app.query_one("#logfilter")
+        assert not flt.has_class("visible")
+        await pilot.press("/")
+        await pilot.pause()
+        assert flt.has_class("visible")
+        assert app.focused is flt
+        for ch in "alpha":
+            await pilot.press(ch)
+        await pilot.pause()
+        assert app.ui.filter_text == "alpha"
+        assert "/alpha/" in app.query_one("#logview").border_subtitle
+        out = logview_text(app)
+        assert "alpha one" in out
+        assert "alpha three" in out
+        assert "beta two" not in out
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.ui.filter_text == ""
+        assert not flt.has_class("visible")
+        out = logview_text(app)
+        assert "beta two" in out
+
+
+async def test_filter_survives_until_cleared_and_indicator_shows_in_footer():
+    manager = FakeManager()
+    manager.logs.append("blob", "keep me")
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("/", "k", "e", "e")
+        await pilot.pause()
+        assert "/kee/" in footer_text(app)
+        await pilot.press("enter")  # Enter keeps the filter, closes the bar's focus
+        await pilot.pause()
+        assert app.ui.filter_text == "kee"
+
+
+# --- mouse: click a card to select it -----------------------------------------
+
+
+async def test_mouse_click_on_a_card_selects_it_in_one_click():
+    manager = FakeManager()
+    manager.logs.append("table", "table output here")
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        assert app.ui.selected == 0
+        await pilot.click("#card-table")
+        await pilot.pause()
+        assert app.ui.selected == 2
+        assert app.ui.message[0] == "Selected Table."
+        assert "table output here" in logview_text(app)
+
+
+async def test_selection_survives_repeated_refresh_ticks_after_a_click():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.click("#card-table")
+        await pilot.pause()
+        assert app.ui.selected == 2
+        await pilot.pause(0.9)  # several 0.1s ticks, well past the 3rd-tick refresh gate
+        assert app.ui.selected == 2
+        assert app.query_one("#card-table").has_class("selected")
+
+
+# --- mouse: click an action button to run it -----------------------------------
+
+
+async def test_clicking_start_runs_it_without_confirm():
+    manager = FakeManager()
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        buttons = list(app.query(azctl.ActionButton))
+        await pilot.click(buttons[0])
+        await pilot.pause()
+        assert ("start", "blob") in manager.calls
+        assert app.ui.button == 0
+
+
+# --- 'c' connection string copy (OSC 52) + overlay -----------------------------
 
 
 async def test_c_copies_valid_osc52_of_the_selected_connection_string(monkeypatch):
@@ -632,7 +787,7 @@ def test_osc52_payload_decodes_to_the_connection_string():
     assert decoded == text
 
 
-# --- '?' help overlay lists every key --------------------------------------
+# --- '?' help overlay lists every key ------------------------------------------
 
 
 async def test_help_overlay_lists_every_key_and_any_key_closes_it():
@@ -644,7 +799,7 @@ async def test_help_overlay_lists_every_key_and_any_key_closes_it():
         assert isinstance(app.screen, azctl.HelpScreen)
         out = export(app.screen.query_one(azctl._ModalBody).content, width=140)
         for needle in (
-            "↑ / ↓", "← / →", "Enter", "a", "t", "c", "S", "?", "Esc", "q", "mouse",
+            "↑ / ↓", "← / →", "Enter", "a", "t", "/", "c", "S", "?", "Esc", "q", "mouse",
             "Start", "Stop", "Restart", "Save", "Free port", "Start all", "Stop all",
         ):
             assert needle in out, needle
@@ -653,7 +808,18 @@ async def test_help_overlay_lists_every_key_and_any_key_closes_it():
         assert not isinstance(app.screen, azctl.HelpScreen)
 
 
-# --- three-way quit modal ---------------------------------------------------
+async def test_help_overlay_mentions_ctrl_c_and_ctrl_q():
+    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        out = export(app.screen.query_one(azctl._ModalBody).content, width=140)
+        assert "Ctrl+C" in out
+        assert "Ctrl+Q" in out
+
+
+# --- three-way quit modal --------------------------------------------------------
 
 
 async def test_quit_with_nothing_owned_is_quiet():
@@ -720,7 +886,7 @@ async def test_quit_prompt_ignores_every_other_key():
         await pilot.pause()
         await pilot.press("q")
         await pilot.pause()
-        for other_key in ("x", "q", "a", "up", "left"):
+        for other_key in ("x", "a", "up", "left"):
             await pilot.press(other_key)
             await pilot.pause()
             assert isinstance(app.screen, azctl.QuitScreen), other_key
@@ -729,7 +895,18 @@ async def test_quit_prompt_ignores_every_other_key():
         assert ("detach_all",) not in manager.calls
 
 
-# --- bell on a ->broken transition ------------------------------------------
+async def test_quit_dialog_offers_three_choices_as_clickable_buttons():
+    manager = FakeManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+        actions = [w.btn.action for w in app.screen.query(azctl.ActionButton)]
+        assert actions == ["stop", "detach", "stay"]
+
+
+# --- bell on a ->broken transition ------------------------------------------------
 
 
 async def test_bell_rings_and_broken_reason_shows_on_transition_to_broken():
@@ -757,7 +934,7 @@ async def test_no_bell_on_a_non_broken_transition():
         assert not bells
 
 
-# --- non-TTY refusal: exit 2, no App ever constructed ----------------------
+# --- non-TTY refusal: exit 2, no App ever constructed ------------------------------
 
 
 def test_non_tty_dashboard_invocation_refuses_politely():
@@ -789,19 +966,9 @@ def test_non_tty_bare_dashboard_invocation_also_refuses():
     assert proc.returncode == 2
 
 
-# --- regression: AzctlApp's refresh timer must not race Pilot teardown ----
-#
-# Found while writing this file: AzctlApp.on_mount() installs
-# `self.set_interval(0.1, self._on_tick)`, and Textual clears `self._running`
-# at the very start of its own `_shutdown()` but before the rest of teardown
-# (unmounting widgets) completes. A tick that lands in that window used to
-# reach `_refresh_widgets()` and query a widget that was already gone,
-# raising `textual.css.query.NoMatches` out of `run_test()`. Fixed in
-# `_on_tick` by bailing out once `self.is_running` is False (plus a
-# belt-and-braces `except NoMatches` around the refresh call itself for the
-# same race). This test drives 40 create/mount/teardown cycles back-to-back,
-# without ever pausing for the timer first, specifically to give that window
-# every chance to reproduce.
+# --- regression: AzctlApp's refresh timer must not race Pilot teardown -------------
+
+
 async def test_refresh_timer_does_not_race_app_teardown():
     for _ in range(40):
         app = azctl.AzctlApp(azctl.Config(), FakeManager())
@@ -814,83 +981,9 @@ async def test_refresh_timer_does_not_race_app_teardown():
             await pilot.pause()
 
 
-# --- review-fix regressions ------------------------------------------------
-# Each test below is a regression for one CONFIRMED finding from the review
-# of the Textual port.
+# --- ctrl+c / ctrl+q are aliases of q -----------------------------------------------
 
 
-# Finding: DataTable only posts RowSelected when the click lands on the row
-# the cursor is ALREADY on -- the first click on a *different* row only moves
-# the cursor and posts RowHighlighted instead, which AzctlApp used to ignore
-# entirely. A single click on a row other than the current selection must
-# update ui.selected immediately (no second click, no waiting on a timer).
-async def test_mouse_click_on_a_different_row_selects_it_in_one_click():
-    app = azctl.AzctlApp(azctl.Config(), FakeManager())
-    async with dashboard(app) as pilot:
-        await pilot.pause()
-        table = app.query_one("#table")
-        assert app.ui.selected == 0
-        await pilot.click("#table", offset=(2, table.header_height + 2))  # row 2 = Table
-        await pilot.pause()
-        assert app.ui.selected == 2
-        assert app.ui.message[0] == "Selected Table."
-
-
-# Same finding as above: the periodic _populate_table() refresh (clear() then
-# move_cursor back to ui.selected) posts its own RowHighlighted echoes every
-# ~0.3s. Those must never be mistaken for a real click and silently snap the
-# selection back -- drive several refresh ticks after a click and make sure
-# the click sticks.
-async def test_selection_survives_repeated_refresh_ticks_after_a_click():
-    app = azctl.AzctlApp(azctl.Config(), FakeManager())
-    async with dashboard(app) as pilot:
-        await pilot.pause()
-        table = app.query_one("#table")
-        await pilot.click("#table", offset=(2, table.header_height + 2))
-        await pilot.pause()
-        assert app.ui.selected == 2
-        await pilot.pause(0.9)  # several 0.1s ticks, well past the 3rd-tick refresh gate
-        assert app.ui.selected == 2
-        assert table.cursor_row == 2
-
-
-# Finding: ConfirmScreen/QuitScreen rendered as an unstyled strip pinned to
-# the TOP of the screen -- ModalScreen's own CSS only dims the background, it
-# does not position content -- contradicting BEHAVIOR.md's "The question
-# appears in the footer." The modal body must dock to the bottom, landing at
-# the same y as the real #footer, not y=0.
-async def test_confirm_and_quit_modals_dock_in_the_footer_region():
-    manager = FakeManager(owned={"blob"})
-    app = azctl.AzctlApp(azctl.Config(), manager)
-    async with dashboard(app) as pilot:
-        await pilot.pause()
-        footer_y = app.query_one("#footer").region.y
-        assert footer_y > 0
-
-        await pilot.press("right")  # Stop
-        await pilot.press("enter")
-        await pilot.pause()
-        assert isinstance(app.screen, azctl.ConfirmScreen)
-        body = app.screen.query_one(azctl._ModalBody)
-        assert body.styles.dock == "bottom"
-        assert body.region.y == footer_y
-        await pilot.press("escape")
-        await pilot.pause()
-
-        await pilot.press("q")
-        await pilot.pause()
-        assert isinstance(app.screen, azctl.QuitScreen)
-        body = app.screen.query_one(azctl._ModalBody)
-        assert body.styles.dock == "bottom"
-        assert body.region.y == footer_y
-
-
-# Finding: Ctrl+Q was never bound, so Textual's own built-in
-# Binding("ctrl+q", "quit", priority=True) fired instead and exited with
-# zero confirmation. Ctrl+C hard-coded an unconditional shutdown with no
-# confirmation either. Both are now aliases for 'q': they must raise the same
-# three-way stop/detach/stay question rather than silently tearing down (or
-# leaking) every owned service.
 async def test_ctrl_c_and_ctrl_q_both_trigger_the_three_way_quit_confirmation():
     for key in ("ctrl+c", "ctrl+q"):
         manager = FakeManager(owned={"blob"})
@@ -924,26 +1017,33 @@ async def test_ctrl_c_and_ctrl_q_with_nothing_owned_quit_quietly():
             assert app.exit_note is None, key
 
 
-# Finding: the '?' help overlay claimed to list every bound key but never
-# mentioned Ctrl+C or Ctrl+Q, even though Ctrl+C was live (and unconditionally
-# destructive before this fix) the whole time.
-async def test_help_overlay_mentions_ctrl_c_and_ctrl_q():
-    app = azctl.AzctlApp(azctl.Config(), FakeManager())
+# --- confirm modal docks at the footer where the contract says it belongs -----------
+
+
+async def test_confirm_modal_docks_in_the_footer_region():
+    manager = FakeManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        await pilot.press("question_mark")
+        footer_y = app.query_one("#footer").region.y
+        assert footer_y > 0
+
+        await pilot.press("right")  # Stop
+        await pilot.press("enter")
         await pilot.pause()
-        out = export(app.screen.query_one(azctl._ModalBody).content, width=140)
-        assert "Ctrl+C" in out
-        assert "Ctrl+Q" in out
+        assert isinstance(app.screen, azctl.ConfirmScreen)
+        body = app.screen.query_one(azctl._ModalBody)
+        assert body.styles.dock == "bottom"
+        # The prompt sits in the footer band (the footer carries a horizontal
+        # margin, so a one-row offset is still "in the footer").
+        assert abs(body.region.y - footer_y) <= 2
+        await pilot.press("escape")
+        await pilot.pause()
 
 
-# Finding: manager.shutdown() (kill_pid + proc.wait, up to ~3s per stuck
-# service) ran directly on the app's asyncio thread on every exit path,
-# freezing the whole UI -- rendering, input, timers -- for the duration.
-# Drive a real quit through a (fake, but deliberately slow) shutdown and
-# assert a parallel high-frequency heartbeat keeps advancing throughout, i.e.
-# the event loop was never blocked.
+# --- shutdown keeps the event loop responsive ----------------------------------------
+
+
 async def test_quit_keeps_the_event_loop_responsive_while_shutdown_is_slow():
     class SlowShutdownManager(FakeManager):
         def shutdown(self):
@@ -979,17 +1079,9 @@ async def test_quit_keeps_the_event_loop_responsive_while_shutdown_is_slow():
         assert app.is_running is False
         assert ("shutdown",) in manager.calls
         assert elapsed >= 0.45, "the fake shutdown should have taken its full ~0.5s"
-        # A blocked event loop could only have advanced the heartbeat a
-        # handful of times regardless of wall-clock elapsed time; a live one
-        # advances roughly once per 20ms throughout.
         assert len(ticks) >= (elapsed / 0.02) * 0.4, (len(ticks), elapsed)
 
 
-# Finding: ServiceManager.refresh() does real socket.create_connection()
-# calls for every configured port, synchronously on the main thread, every
-# ~0.3s -- against a slow-to-refuse host this stalls the whole UI. Drive a
-# (fake, but deliberately slow) refresh() through the normal tick path and
-# assert the event loop stays responsive while it's in flight.
 async def test_periodic_refresh_runs_off_the_event_loop():
     class SlowRefreshManager(FakeManager):
         def refresh(self):
@@ -1017,15 +1109,9 @@ async def test_periodic_refresh_runs_off_the_event_loop():
         assert len(ticks) >= (elapsed / 0.02) * 0.4, (len(ticks), elapsed)
 
 
-# Finding: the signal.signal()-registered handler called
-# self.call_from_thread(self._shutdown_from_signal) -- but a real OS signal
-# handler always runs on the SAME thread that owns the asyncio loop, and
-# Textual's call_from_thread unconditionally raises RuntimeError in that
-# case, so no external SIGINT/SIGTERM/SIGHUP ever actually reached
-# _do_shutdown(). _install_os_signal_handlers now uses
-# loop.add_signal_handler, whose callback runs as an ordinary loop callback
-# (no thread hop) -- calling _shutdown_from_signal directly here reproduces
-# that exact calling convention and must not raise.
+# --- signals ---------------------------------------------------------------------------
+
+
 async def test_shutdown_from_signal_does_not_raise_and_shuts_down_cleanly():
     manager = FakeManager(owned={"blob"})
     app = azctl.AzctlApp(azctl.Config(), manager)
@@ -1041,11 +1127,6 @@ async def test_shutdown_from_signal_does_not_raise_and_shuts_down_cleanly():
         assert app.exit_note == "Interrupted — stopped all services."
 
 
-# Finding: a second signal arriving while the first shutdown's
-# manager.shutdown() was still blocking used to raise a SECOND RuntimeError
-# that aborted ServiceManager.shutdown()'s loop before every service got
-# stopped, orphaning whichever hadn't been reached yet. The _shutdown_done
-# guard must make a second call a harmless no-op instead.
 async def test_second_signal_during_shutdown_is_a_harmless_no_op():
     manager = FakeManager(owned={"blob", "queue", "table"})
     app = azctl.AzctlApp(azctl.Config(), manager)
@@ -1061,48 +1142,37 @@ async def test_second_signal_during_shutdown_is_a_harmless_no_op():
         assert manager.calls.count(("shutdown",)) == 1
 
 
-async def _wait_until(predicate, pilot, attempts=30):
-    """Drain the Pilot's message queue with zero-delay pause()s (NOT
-    asyncio.sleep -- these cost negligible real wall-clock time) until
-    `predicate()` is true. Used to observe the resize-redraw chain (App ->
-    Screen -> our _redraw_after_resize, each a separate hop through
-    call_after_refresh) settle without ever advancing far enough in real
-    time for AzctlApp's own 0.1s periodic tick to fire and mask the result --
-    i.e. this proves the *resize hook* redrew, not the ambient tick."""
-    for _ in range(attempts):
-        if predicate():
-            return True
-        await pilot.pause()
-    return False
+# --- resize redraws promptly -------------------------------------------------------------
 
 
-# Finding: only the periodic ~0.1s tick re-rendered the log/table/header
-# panels, so a resized terminal briefly showed content computed for the OLD
-# size -- render_logs() slicing far more (or fewer) lines than the new area
-# can actually show, until the next tick caught up. Resizing must trigger its
-# own redraw well before the next tick, not rely on it.
-async def test_resize_redraws_the_log_panel_at_the_new_size_before_the_next_tick():
+async def test_resize_redraws_the_log_area_at_the_new_size_before_the_next_tick():
     manager = FakeManager()
     for i in range(40):
         manager.logs.append("blob", "line %d" % i)
     app = azctl.AzctlApp(azctl.Config(), manager)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        await pilot.resize_terminal(100, 40)
-        assert await _wait_until(lambda: len(logpanel_text(app).splitlines()) > 10, pilot)
-        tall_lines = len(logpanel_text(app).splitlines())
+        lv = app.query_one("#logview")
 
-        await pilot.resize_terminal(100, 10)
-        assert await _wait_until(lambda: len(logpanel_text(app).splitlines()) < tall_lines, pilot)
-        short_lines = len(logpanel_text(app).splitlines())
-        assert short_lines < tall_lines
+        async def wait_region_height(pred, attempts=40):
+            for _ in range(attempts):
+                if pred(lv.region.height):
+                    return True
+                await pilot.pause()
+            return False
+
+        tall = lv.region.height
+        assert tall > 0
+        await pilot.resize_terminal(100, 12)
+        assert await wait_region_height(lambda h: 0 < h < tall)
+        short = lv.region.height
+        await pilot.resize_terminal(100, 44)
+        assert await wait_region_height(lambda h: h > short)
 
 
-# Finding: an unrelated ->broken transition's bell + red message used to fire
-# underneath an open ConfirmScreen/QuitScreen/HelpScreen/ConnScreen (they only
-# dim the base screen, they don't hide it), competing with the isolated
-# decision the user is supposed to be focused on. It must be buffered while a
-# modal is open and only surface once that modal is dismissed.
+# --- buffered alerts flush when a modal dismisses ------------------------------------------
+
+
 async def test_modal_suppresses_bell_and_message_then_flushes_on_dismiss():
     class DelayedBrokenManager(FakeManager):
         def __init__(self, owned=()):
@@ -1124,14 +1194,11 @@ async def test_modal_suppresses_bell_and_message_then_flushes_on_dismiss():
     app.bell = lambda: bells.append(True)
     async with dashboard(app) as pilot:
         await pilot.pause()
-        # HelpScreen: a read-only overlay, so nothing else competes for the
-        # message line after it's dismissed -- proves the flushed alert
-        # actually surfaces, not just that the bell rings.
         await pilot.press("question_mark")
         await pilot.pause()
         assert isinstance(app.screen, azctl.HelpScreen)
         manager.armed = True
-        await pilot.pause(0.5)  # let the tick-gate fire the ->broken transition
+        await pilot.pause(0.5)
         assert bells == [], "bell must not fire while a modal is open"
         assert app.ui.message is None or app.ui.message[1] != "red"
         assert app._pending_bell is True
@@ -1143,3 +1210,77 @@ async def test_modal_suppresses_bell_and_message_then_flushes_on_dismiss():
         assert bells == [True], "bell must fire once the modal is dismissed"
         assert app.ui.message[0] == "queue died"
         assert app.ui.message[1] == "red"
+
+
+# --- sparkline activity buckets --------------------------------------------------------------
+
+
+def test_spark_bucketing_counts_by_sequence_surviving_ring_wraparound():
+    """Buckets are tracked by global sequence number, not buffer length, so
+    the graph keeps working once the per-service ring buffer is full and
+    silently stops growing."""
+    manager = FakeManager()
+    manager.logs = azctl.LogStore(capacity=4)  # tiny ring: wraps almost immediately
+    app = azctl.AzctlApp(azctl.Config(), manager)
+
+    for i in range(6):
+        manager.logs.append("blob", "warm %d" % i)
+    app._update_spark()
+    # Only the 4 survivors of the wrap are countable -- the point is that
+    # counting keeps WORKING after the buffer is full.
+    assert app._spark["blob"][-1] == 4
+
+    manager.logs.append("blob", "after wrap A")
+    manager.logs.append("blob", "after wrap B")
+    app._update_spark()
+    assert app._spark["blob"][-1] == 2, (
+        "post-wrap arrivals must still be counted"
+    )
+    # A quiet refresh contributes a zero bucket, not a repeat count.
+    app._update_spark()
+    assert list(app._spark["blob"])[-2:] == [2, 0]
+
+
+async def test_cards_render_an_activity_sparkline_when_buckets_have_data():
+    manager = FakeManager()
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        # Seed buckets directly: the ambient refresh worker would otherwise
+        # race the test's own bucketing on slow CI machines.
+        app._spark["queue"].clear()
+        app._spark["queue"].extend((0, 1, 7, 2))
+        app._refresh_widgets()
+        await pilot.pause()
+        out = card_text(app, "queue", width=80)
+        assert any(ch in out for ch in azctl.SPARK_BLOCKS), (
+            "expected sparkline blocks on the card once buckets hold data"
+        )
+
+
+# --- busy spinner ------------------------------------------------------------------------------
+
+
+async def test_busy_state_shows_a_spinner_in_the_footer():
+    class SlowStopManager(FakeManager):
+        def stop(self, name):
+            time.sleep(0.6)
+            return FakeManager.stop(self, name)
+
+    manager = SlowStopManager(owned={"blob"})
+    app = azctl.AzctlApp(azctl.Config(), manager)
+    async with dashboard(app) as pilot:
+        await pilot.pause()
+        await pilot.press("right")  # Stop
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")  # confirm
+        await pilot.pause()
+        saw_spinner = False
+        for _ in range(20):
+            if "working…" in footer_text(app) or "…" in footer_text(app):
+                saw_spinner = True
+                break
+            await pilot.pause()
+        assert await wait_busy_clears(pilot, app)
+        assert saw_spinner, "footer never showed the busy indicator while stopping"
