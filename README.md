@@ -1,5 +1,7 @@
 # azctl
 
+[![CI](https://github.com/iAmChumby/azctl/actions/workflows/ci.yml/badge.svg)](https://github.com/iAmChumby/azctl/actions/workflows/ci.yml)
+
 **A single-file Textual TUI for the [Azurite](https://github.com/Azure/Azurite) Azure Storage emulator.**
 
 Azurite is really three services running side by side — Blob, Queue, and Table — and out of the box there is no single place to see whether they are up, down, or broken. `azctl` is that place: a full-screen terminal dashboard that shows the health of all three services at once, lets you start and stop them, streams their logs live, and names the process squatting on a port when something else has claimed it.
@@ -104,8 +106,21 @@ Nothing in this tool can touch stored data. It manages *whether the services run
 - **Toast notifications** — significant results (started, stopped, broken, saved) also pop up as toasts so they're hard to miss.
 - **Busy spinner** — the message line spins while a confirmed action is still finishing, so the app never looks frozen.
 - **Bell + toast on broken** — an audible and visible cue the moment a service flips to broken, suppressed while you're in a confirmation so it never competes with a decision.
-- **`status --json`** — machine-readable snapshot for scripts and CI.
-- **Config file + flags** — custom ports, host, data directory via `~/.config/azctl/config.json` or `--blob-port`-style flags.
+- **`status --json`** — machine-readable snapshot for scripts and CI:
+
+  ```json
+  {
+    "host": "127.0.0.1",
+    "data_dir": "/home/you/.azurite",
+    "services": {
+      "blob":  { "port": 10000, "state": "port in use", "pid": 24188 },
+      "queue": { "port": 10001, "state": "stopped",     "pid": null },
+      "table": { "port": 10002, "state": "stopped",     "pid": null }
+    }
+  }
+  ```
+
+- **Config file + flags** — custom ports, host, data directory via `~/.config/azctl/config.json` (Windows: `%APPDATA%\azctl\config.json`) or `--blob-port`-style flags.
 - **Mouse support** — click a service card to select it, click an action to run it.
 - **Save all** — one keystroke (`S`) writes the merged log of all three services, each line tagged with its service name and timestamp, to a single plain-text file (`azurite-all.log`).
 - **Version line** — the header shows the Azurite and Node versions actually in use, so "works on my machine" arguments end faster.
@@ -116,6 +131,16 @@ Nothing in this tool can touch stored data. It manages *whether the services run
 - Python 3.9+ (any OS — Linux, macOS, Windows)
 - Node.js + `npm install -g azurite` (azctl will tell you if it's missing)
 - Textual and psutil are bootstrapped automatically on first run if not present
+
+## Development
+
+```bash
+pip install pytest pytest-asyncio textual psutil ruff
+pytest -q          # full suite (~183 tests)
+ruff check azctl.py tests/
+```
+
+A bare `pytest` on a fresh clone skips the dependency-dependent modules cleanly; the read-only command tests run with the standard library alone. CI runs lint plus the suite on Linux/macOS/Windows × Python 3.9/3.12, and cold-starts the app on a deps-less runner as a smoke test.
 
 ## Behavior spec
 

@@ -62,6 +62,16 @@ MESSAGE_TTL = 4.0
 BOOTSTRAP_SENTINEL = "AZCTL_BOOTSTRAPPED"
 INSTALL_HINT = "npm install -g azurite"
 
+__version__ = "1.0.0"
+
+# Version floors for the private-venv bootstrap. Textual breaks APIs between
+# major versions (this file is written against the 8.x API), and an unpinned
+# `pip install textual` would let a future major release break every fresh
+# install the day it ships — so constrain to a known-good range instead.
+TEXTUAL_SPEC = "textual>=8,<9"
+PSUTIL_SPEC = "psutil>=5.7"
+DEP_SPECS = (TEXTUAL_SPEC, PSUTIL_SPEC)
+
 # The well-known Azurite development account (public constants, not secrets).
 ACCOUNT_NAME = "devstoreaccount1"
 ACCOUNT_KEY = (
@@ -130,7 +140,7 @@ def _bootstrap_explain(venv_dir, vpy, detail="") -> None:
         "The usual causes are no network access, a missing/broken pip, a corrupted",
         "virtualenv, or (on Debian/Ubuntu) a system Python missing python3-venv.",
         "You can finish the setup manually with:",
-        "    " + str(vpy) + " -m pip install textual psutil",
+        "    " + str(vpy) + " -m pip install " + " ".join('"%s"' % s for s in DEP_SPECS),
         "If that reports \"already satisfied\" but azctl still can't import them,",
         "the install itself may be corrupted — force a clean reinstall with:",
         "    " + str(vpy) + " -m pip install --force-reinstall --no-cache-dir textual psutil",
@@ -206,7 +216,7 @@ def _bootstrap_and_reexec() -> None:
     )
     try:
         proc = subprocess.run(
-            [str(vpy), "-m", "pip", "install", "--quiet", "textual", "psutil"],
+            [str(vpy), "-m", "pip", "install", "--quiet", *DEP_SPECS],
             capture_output=True,
             text=True,
         )
@@ -226,7 +236,7 @@ def _bootstrap_and_reexec() -> None:
             proc = subprocess.run(
                 [
                     str(vpy), "-m", "pip", "install", "--quiet",
-                    "--force-reinstall", "--no-cache-dir", "textual", "psutil",
+                    "--force-reinstall", "--no-cache-dir", *DEP_SPECS,
                 ],
                 capture_output=True,
                 text=True,
@@ -2044,6 +2054,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--queue-port", type=int, default=None, help="Queue port (default 10001)")
     parser.add_argument("--table-port", type=int, default=None, help="Table port (default 10002)")
     parser.add_argument("--data-dir", default=None, help="Azurite data location (default ~/.azurite)")
+    parser.add_argument(
+        "--version", action="version", version="azctl " + __version__,
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("up", help="open the dashboard and start all three services")
     status = sub.add_parser("status", help="one read-only snapshot, then exit")

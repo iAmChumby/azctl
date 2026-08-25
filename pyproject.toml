@@ -1,2 +1,33 @@
+[project]
+name = "azctl"
+version = "1.0.0"
+description = "A single-file Textual TUI dashboard for the Azurite Azure Storage emulator."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Luke Edwards" }]
+keywords = ["azurite", "azure", "storage", "emulator", "tui", "textual"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/iAmChumby/azctl"
+Issues = "https://github.com/iAmChumby/azctl/issues"
+
+[project.optional-dependencies]
+app = ["textual>=8,<9", "psutil>=5.7"]
+dev = ["pytest", "pytest-asyncio", "textual>=8,<9", "psutil>=5.7", "ruff"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
